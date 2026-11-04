@@ -1,0 +1,404 @@
+@import "tailwindcss";
+
+/* Enable Tailwind's `dark:` variant to key off a `.dark` class on <html>
+   instead of the OS `prefers-color-scheme` media query, so the in-app
+   toggle (see src/hooks/useTheme.ts) has full control. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+  Self-hosted type faces (files vendored under public/fonts/, latin subset
+  only — this product is English-only, see the 1.4.1 release notes on
+  removing Bengali text). Previously loaded from a Google Fonts CDN
+  <link> in index.html: harmless when the browser has internet access, but
+  this app is pitched as self-hosted with "no third-party SaaS dependency
+  for core operations" (see README) and is commonly run on a LAN-only
+  CasaOS/NAS box with restricted or no outbound internet — there, the CDN
+  request silently fails and every heading/label/number falls back to a
+  generic system font, which is what made the UI look visibly "off" versus
+  its intended design. Vendoring the files removes that dependency
+  entirely; rendering is identical to the CDN version since these are the
+  exact same files Google Fonts itself serves.
+*/
+@font-face {
+  font-family: "Fraunces";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("/fonts/fraunces.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("/fonts/ibmplexsans.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/ibmplexmono-400.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/fonts/ibmplexmono-500.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("/fonts/ibmplexmono-600.woff2") format("woff2");
+}
+
+/*
+  Design tokens — "Apothecary Modern": a matte harbor-blue/seafoam/bone
+  palette on a warm neutral ground, no gradients, no saturated/neon
+  accents. Defined once as real (runtime-switchable) CSS custom
+  properties, then aliased into Tailwind's theme via `@theme inline` so
+  every component can use them as ordinary utility classes: bg-bg,
+  bg-surface, bg-surface-elevated, border-border, text-text,
+  text-text-muted, bg-primary, text-primary, bg-primary-hover,
+  text-primary-foreground, bg-accent, bg-success, bg-warning, bg-danger
+  (and their text-/border- counterparts).
+*/
+:root {
+  --color-bg: #f2efe7;
+  --color-surface: #fbfaf6;
+  --color-surface-elevated: #ffffff;
+  --color-border: #ded7c6;
+  --color-text: #1c2b38;
+  --color-text-muted: #5c6b75;
+  --color-primary: #3368a0;
+  --color-primary-hover: #285480;
+  --color-primary-foreground: #f7f5ef;
+  --color-accent: #4d7f96;
+  --color-accent-soft: #c8dfdb;
+  --color-success: #47765d;
+  --color-warning: #a8763c;
+  --color-danger: #a2483f;
+  /* Not exposed as a Tailwind utility; used directly via bg-[var(--color-overlay)] */
+  --color-overlay: rgb(28 43 56 / 0.55);
+  /* Glass material tokens — see the .glass-panel family below. */
+  --glass-tint: var(--color-surface);
+  --glass-highlight: rgb(255 255 255 / 0.6);
+  --glass-shadow: rgb(28 43 56 / 0.14);
+  --glass-shadow-soft: rgb(28 43 56 / 0.07);
+}
+
+.dark {
+  --color-bg: #121a22;
+  --color-surface: #182430;
+  --color-surface-elevated: #202f3c;
+  --color-border: rgb(200 223 219 / 0.12);
+  --color-text: #eae6da;
+  --color-text-muted: #93a3ac;
+  --color-primary: #6fa0c8;
+  --color-primary-hover: #8ab3d6;
+  --color-primary-foreground: #10202e;
+  --color-accent: #7fb3bd;
+  --color-accent-soft: #2c3e42;
+  --color-success: #6fa588;
+  --color-warning: #c9a06a;
+  --color-danger: #c17b73;
+  --color-overlay: rgb(10 15 20 / 0.7);
+  --glass-tint: var(--color-surface-elevated);
+  --glass-highlight: rgb(255 255 255 / 0.06);
+  --glass-shadow: rgb(0 0 0 / 0.5);
+  --glass-shadow-soft: rgb(0 0 0 / 0.28);
+}
+
+@theme inline {
+  --color-bg: var(--color-bg);
+  --color-surface: var(--color-surface);
+  --color-surface-elevated: var(--color-surface-elevated);
+  --color-border: var(--color-border);
+  --color-text: var(--color-text);
+  --color-text-muted: var(--color-text-muted);
+  --color-primary: var(--color-primary);
+  --color-primary-hover: var(--color-primary-hover);
+  --color-primary-foreground: var(--color-primary-foreground);
+  --color-accent: var(--color-accent);
+  --color-accent-soft: var(--color-accent-soft);
+  --color-success: var(--color-success);
+  --color-warning: var(--color-warning);
+  --color-danger: var(--color-danger);
+
+  /* Apothecary Modern type system — a warm display serif used with
+     restraint, a systematic UI sans for body/labels, and a mono face
+     reserved for tabular data (prices, SKUs, invoice numbers). */
+  --font-display: "Fraunces", "Iowan Old Style", "Georgia", serif;
+  --font-sans: "Cairo", "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", "SFMono-Regular", ui-monospace, monospace;
+
+  /* A tighter, more deliberate radius scale than Tailwind's defaults —
+     the previous UI leaned on rounded-2xl/3xl almost everywhere, which
+     reads as generic/AI-templated at this density. Buttons and inputs
+     stay crisp; only large hero/modal surfaces get real softness. */
+  --radius-sm: 0.3125rem; /* 5px */
+  --radius-md: 0.4375rem; /* 7px */
+  --radius-lg: 0.625rem; /* 10px */
+  --radius-xl: 0.75rem; /* 12px */
+  --radius-2xl: 0.875rem; /* 14px */
+  --radius-3xl: 1.125rem; /* 18px */
+}
+
+@layer base {
+  body {
+    @apply bg-bg text-text antialiased selection:bg-primary selection:text-primary-foreground;
+    font-family: var(--font-sans);
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    transition: background-color 0.2s ease, color 0.2s ease;
+  }
+
+  h1, h2, h3 {
+    font-family: var(--font-display);
+    letter-spacing: -0.01em;
+  }
+
+  /* Tabular data — prices, quantities, SKUs, invoice/phone numbers —
+     gets the mono face with tabular figures so columns of numbers
+     actually align. Opt in with font-mono / .tabular-figures. */
+  .tabular-figures {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Custom scrollbars, token-aware for both themes */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-muted);
+}
+
+/*
+  Glass material — token-based so it renders correctly in both themes.
+  Wrapped in @layer utilities so it participates in Tailwind's cascade
+  layers correctly: unlayered CSS always beats layered CSS regardless of
+  source order or specificity, which previously made these rules silently
+  override Tailwind utilities like `fixed` or `border-t-0` on any element
+  that combined them (that's exactly what broke the mobile sidebar — see
+  git history — `.glass-sheen`'s unlayered `position: relative` was beating
+  Tailwind's layered `.fixed`, turning a fixed off-screen sidebar back into
+  a normal-flow 288px-wide flex child).
+
+  Real depth here comes from three things layered together, all
+  token-driven, and deliberately matte (no rainbow refraction, no bloom):
+    1. Genuine translucency (color-mix against transparent, not a solid hex)
+       so blur has something behind it to soften.
+    2. A very restrained saturate() alongside blur() — just enough to keep
+       the material from looking flat/gray, not the vibrant "frosted neon"
+       effect of a heavier saturate().
+    3. An inset top highlight + layered outer shadow, standing in for a
+       light source catching the upper edge of a physical pane.
+  Reserve .glass-sheen (a soft top-left light catch) for one or two hero
+  surfaces per screen — applied everywhere it stops reading as intentional.
+
+  .glass-panel-subtle deliberately does NOT set `border` (unlike
+  .glass-panel) — it's used on structural chrome (header/sidebar) that only
+  wants a border on one side, which the consumer sets itself via an
+  ordinary `border-b`/`border-r` Tailwind utility; a shorthand `border` here
+  would fight that the same way `position` did above. .glass-sheen also
+  deliberately does NOT set `position` — the host element must already be
+  `relative`/`fixed`/`absolute`/`sticky` itself (add a plain `relative`
+  utility alongside it if it isn't already positioned some other way).
+*/
+@layer utilities {
+  .glass-panel {
+    background-color: color-mix(in srgb, var(--glass-tint) 82%, transparent);
+    backdrop-filter: blur(24px) saturate(1.15);
+    -webkit-backdrop-filter: blur(24px) saturate(1.15);
+    border: 1px solid var(--color-border);
+    box-shadow:
+      0 20px 48px -20px var(--glass-shadow),
+      0 6px 18px -10px var(--glass-shadow-soft),
+      inset 0 1px 0 0 var(--glass-highlight);
+  }
+
+  .glass-panel-subtle {
+    background-color: color-mix(in srgb, var(--glass-tint) 68%, transparent);
+    backdrop-filter: blur(16px) saturate(1.1);
+    -webkit-backdrop-filter: blur(16px) saturate(1.1);
+    box-shadow: inset 0 1px 0 0 var(--glass-highlight);
+  }
+
+  .glass-input {
+    background-color: color-mix(in srgb, var(--color-surface) 88%, transparent);
+    border: 1px solid var(--color-border);
+    color: var(--color-text);
+  }
+
+  .glass-input:focus {
+    border-color: var(--color-primary);
+    outline: none;
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-primary) 22%, transparent);
+  }
+
+  .glass-card-hover {
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .glass-card-hover:hover {
+    border-color: var(--color-primary);
+    transform: translateY(-1px);
+  }
+
+  /* The one recurring "signature" glass cue — a faint light catching the
+     upper-left of a pane. Apply to a handful of hero surfaces (the login
+     card, the sidebar), never as a blanket rule on every panel. */
+  .glass-sheen {
+    overflow: hidden;
+  }
+  .glass-sheen::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: radial-gradient(
+      120% 90% at 12% -10%,
+      color-mix(in srgb, var(--glass-highlight) 60%, transparent) 0%,
+      transparent 55%
+    );
+  }
+
+  /*
+    Entrance/exit animation primitives (the `tailwindcss-animate` plugin's
+    convention — composable enter/exit utilities driven by CSS custom
+    properties feeding one shared keyframe each) — used across every modal
+    in the app (`animate-in fade-in zoom-in-95`, 26 files) but the plugin
+    was never actually installed or registered, so Tailwind generated no
+    CSS for any of these class names: every modal has been popping open
+    instantly with no fade or scale-in at all. Hand-rolled here (same
+    variable names/behavior as the real plugin) rather than adding the
+    dependency, since only these two entrance effects are actually used.
+  */
+  @keyframes kinetirx-enter {
+    from {
+      opacity: var(--tw-enter-opacity, 1);
+      transform: translate3d(var(--tw-enter-translate-x, 0), var(--tw-enter-translate-y, 0), 0)
+        scale3d(var(--tw-enter-scale, 1), var(--tw-enter-scale, 1), var(--tw-enter-scale, 1));
+    }
+  }
+  @keyframes kinetirx-exit {
+    to {
+      opacity: var(--tw-exit-opacity, 1);
+      transform: translate3d(var(--tw-exit-translate-x, 0), var(--tw-exit-translate-y, 0), 0)
+        scale3d(var(--tw-exit-scale, 1), var(--tw-exit-scale, 1), var(--tw-exit-scale, 1));
+    }
+  }
+  .animate-in {
+    animation-name: kinetirx-enter;
+    animation-duration: 150ms;
+    animation-timing-function: ease-out;
+    animation-fill-mode: both;
+    --tw-enter-opacity: initial;
+    --tw-enter-scale: initial;
+    --tw-enter-translate-x: initial;
+    --tw-enter-translate-y: initial;
+  }
+  .animate-out {
+    animation-name: kinetirx-exit;
+    animation-duration: 150ms;
+    animation-timing-function: ease-in;
+    animation-fill-mode: both;
+    --tw-exit-opacity: initial;
+    --tw-exit-scale: initial;
+    --tw-exit-translate-x: initial;
+    --tw-exit-translate-y: initial;
+  }
+  .fade-in {
+    --tw-enter-opacity: 0;
+  }
+  .fade-out {
+    --tw-exit-opacity: 0;
+  }
+  .zoom-in-95 {
+    --tw-enter-scale: 0.95;
+  }
+  .zoom-out-95 {
+    --tw-exit-scale: 0.95;
+  }
+}
+
+/*
+  Button system — one shared vocabulary so every CTA in the app reads as
+  the same considered product instead of one-off gradient pills. Solid
+  matte fills, a single restrained shadow, and a small lift + brightness
+  shift on hover/active rather than a color-swap or glow.
+
+  `.btn` is declared via `@utility` (not plain `@layer components`)
+  specifically so the variant classes below can `@apply btn` — Tailwind v4
+  only lets `@apply` reference real utilities (its own, or ones registered
+  with `@utility`), not arbitrary custom classes defined by another `@apply`.
+*/
+@utility btn {
+  @apply inline-flex items-center justify-center gap-2 rounded-xl text-sm font-semibold
+    transition-[transform,box-shadow,background-color,border-color] duration-150 ease-out
+    cursor-pointer select-none whitespace-nowrap
+    disabled:cursor-not-allowed disabled:opacity-50 disabled:pointer-events-none
+    focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:ring-offset-2 focus-visible:ring-offset-bg;
+  padding: 0.6rem 1.1rem;
+}
+
+@layer components {
+  .btn:active:not(:disabled) {
+    transform: translateY(1px);
+  }
+
+  .btn-primary {
+    @apply btn bg-primary text-primary-foreground border border-primary shadow-sm;
+  }
+  .btn-primary:hover:not(:disabled) {
+    background-color: var(--color-primary-hover);
+    border-color: var(--color-primary-hover);
+  }
+
+  .btn-secondary {
+    @apply btn text-text border;
+    background-color: color-mix(in srgb, var(--color-surface-elevated) 92%, transparent);
+    border-color: var(--color-border);
+  }
+  .btn-secondary:hover:not(:disabled) {
+    border-color: var(--color-primary);
+    color: var(--color-primary);
+  }
+
+  .btn-ghost {
+    @apply btn bg-transparent text-text-muted border border-transparent;
+  }
+  .btn-ghost:hover:not(:disabled) {
+    background-color: color-mix(in srgb, var(--color-text) 6%, transparent);
+    color: var(--color-text);
+  }
+
+  .btn-danger {
+    @apply btn text-primary-foreground border;
+    background-color: var(--color-danger);
+    border-color: var(--color-danger);
+  }
+  .btn-danger:hover:not(:disabled) {
+    filter: brightness(1.08);
+  }
+
+  .btn-sm {
+    @apply text-xs rounded-lg;
+    padding: 0.4rem 0.75rem;
+  }
+
+  .btn-icon {
+    @apply btn rounded-full p-0 aspect-square;
+  }
+}

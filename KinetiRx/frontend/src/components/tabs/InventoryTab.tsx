@@ -1,0 +1,600 @@
+import React, { useState } from 'react';
+import {
+  AlertTriangle,
+  Barcode as BarcodeIcon,
+  Boxes,
+  Coins,
+  Download,
+  Filter,
+  FlaskConical,
+  Pencil,
+  Plus,
+  Search,
+  ShoppingCart,
+  Sparkles,
+  Stethoscope,
+  Tags,
+  Trash2,
+  Truck,
+  Upload,
+} from 'lucide-react';
+import { InvoiceConfig, Medicine } from '../../types';
+import { exportToCSV } from '../../utils/exportCsv';
+import { getCurrencySymbol, formatMoney } from '../../utils/currency';
+import { BarcodeModal } from '../modals/BarcodeModal';
+import { ImportStockModal } from '../modals/ImportStockModal';
+import { EditStockModal } from '../modals/EditStockModal';
+import { useBarcodeScanner } from '../../hooks/useBarcodeScanner';
+import { useTranslation } from 'react-i18next';
+
+interface InventoryTabProps {
+  invoiceConfig?: InvoiceConfig;
+  medicines: Medicine[];
+  setMedicines?: React.Dispatch<React.SetStateAction<Medicine[]>>;
+  onOpenAddStockModal: () => void;
+  onOpenAddLabStockModal: () => void;
+  onOpenDistributorsModal: () => void;
+  onOpenManageGroupsModal: () => void;
+  onOpenLowStockReorderModal: () => void;
+}
+
+export const InventoryTab: React.FC<InventoryTabProps> = ({
+  invoiceConfig,
+  medicines,
+  setMedicines,
+  onOpenAddStockModal,
+  onOpenAddLabStockModal,
+  onOpenDistributorsModal,
+  onOpenManageGroupsModal,
+  onOpenLowStockReorderModal,
+}) => {
+  const [search, setSearch] = useState('');
+  const [filterType, setFilterType] = useState<'all' | 'meds' | 'labs' | 'low' | 'expiry'>('all');
+  // Stores just the id, not a snapshot of the Medicine object — BarcodeModal
+  // re-derives the live item from `medicines` below every render, so it
+  // reflects a freshly-generated barcode immediately instead of showing
+  // "No barcode assigned yet." until the modal is closed and reopened.
+  const [barcodeTargetId, setBarcodeTargetId] = useState<string | null>(null);
+  const barcodeTarget = medicines.find(m => m.id === barcodeTargetId) || null;
+  const [showImportModal, setShowImportModal] = useState(false);
+  // Same live-lookup-by-id pattern as barcodeTargetId above, so editing a
+  // second time in the same session always shows the latest saved values.
+  const [editTargetId, setEditTargetId] = useState<string | null>(null);
+  const editTarget = medicines.find(m => m.id === editTargetId) || null;
+  const currencySymbol = getCurrencySymbol(invoiceConfig?.currency);
+  const { t } = useTranslation();
+  const [scanFeedback, setScanFeedback] = useState<{ ok: boolean; msg: string } | null>(null);
+
+  // Scan-to-restock: a USB/handheld barcode scanner acts as a fast keyboard
+  // (see useBarcodeScanner) — scanning an item already on the shelf jumps
+  // straight into its Edit Stock form so staff only has to bump the
+  // quantity and save, instead of hunting for it by name in a long list.
+  const handleInventoryScan = (code: string) => {
+    const trimmed = code.trim();
+    const match = medicines.find(m => m.barcode === trimmed);
+    if (match) {
+      setEditTargetId(match.id);
+      setScanFeedback({ ok: true, msg: `Found: ${match.name} — update quantity and save.` });
+    } else {
+      setScanFeedback({
+        ok: false,
+        msg: `No stock item has barcode ${trimmed} yet — use "+ Add New Stock" to register it, then assign this barcode from its barcode icon.`,
+      });
+    }
+    window.setTimeout(() => setScanFeedback(null), 5000);
+  };
+  useBarcodeScanner({ onScan: handleInventoryScan, enabled: true });
+
+  const filtered = medicines.filter(m => {
+    const q = search.toLowerCase();
+    const matchesSearch =
+      m.name.toLowerCase().includes(q) ||
+      (m.salt && m.salt.toLowerCase().includes(q)) ||
+      (m.company && m.company.toLowerCase().includes(q)) ||
+      (m.dist && m.dist.toLowerCase().includes(q)) ||
+      (m.batch && m.batch.toLowerCase().includes(q)) ||
+      (m.rack && m.rack.toLowerCase().includes(q));
+
+    if (!matchesSearch) return false;
+
+    if (filterType === 'meds') return !m.isLabTest && m.itemType !== 'lab_test';
+    if (filterType === 'labs') return m.isLabTest || m.itemType === 'lab_test';
+    if (filterType === 'low') return !m.isLabTest && m.stock <= 10;
+    if (filterType === 'expiry') return !m.isLabTest && m.expiry <= '2026-12';
+    return true;
+  });
+
+  const physicalMeds = medicines.filter(m => !m.isLabTest && m.itemType !== 'lab_test');
+  const labItems = medicines.filter(m => m.isLabTest || m.itemType === 'lab_test');
+
+  const totalStockUnits = physicalMeds.reduce((sum, m) => sum + (m.stock || 0), 0);
+  const totalValuation = physicalMeds.reduce(
+    (sum, m) => sum + (m.rate || m.mrp * 0.7) * m.stock,
+    0
+  );
+  const totalRetailValue = physicalMeds.reduce(
+    (sum, m) => sum + m.mrp * m.stock,
+    0
+  );
+
+  const handleExportCSV = () => {
+    exportToCSV(
+      'medicine_and_lab_inventory',
+      [
+        'Item Type',
+        'Name',
+        'Brand / Company',
+        'Pack / Specimen',
+        'Distributor / Lab Wing',
+        'HSN Code',
+        'Batch / Service ID',
+        'Stock Tracking / Units',
+        'Purchase / Cost Rate (INR)',
+        'Old MRP (INR)',
+        'Selling MRP / Fee (INR)',
+        'GST %',
+        'Discount %',
+        'Expiry Date',
+        'Rack / Chamber',
+      ],
+      medicines.map(m => [
+        m.isLabTest ? 'Lab Test / Diagnostic' : 'Medicine (Physical)',
+        m.name,
+        m.company,
+        m.pack,
+        m.dist,
+        m.hsn,
+        m.batch,
+        m.isLabTest ? (m.trackStock ? `${m.stock} Kits` : 'Service (No Limit)') : `${m.stock} Units`,
+        m.rate.toFixed(2),
+        m.omrp.toFixed(2),
+        m.mrp.toFixed(2),
+        m.gst,
+        m.disc,
+        m.expiry,
+        m.rack,
+      ])
+    );
+  };
+
+  const handleDeleteItem = (id: string, name: string) => {
+    if (!window.confirm(t('inventory.confirmDelete', { name }))) return;
+    if (setMedicines) {
+      setMedicines(prev => prev.filter(m => m.id !== id));
+    }
+  };
+
+  const handleClearAllInventory = () => {
+    if (medicines.length === 0) return;
+    if (!window.confirm(t('inventory.confirmDeleteAll', { count: medicines.length }))) return;
+    if (setMedicines) {
+      setMedicines([]);
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      {scanFeedback && (
+        <div
+          className={`p-3 rounded-2xl border text-xs font-semibold flex items-center gap-2 ${
+            scanFeedback.ok
+              ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-700 dark:text-emerald-300'
+              : 'bg-amber-500/10 border-amber-500/30 text-amber-700 dark:text-amber-300'
+          }`}
+        >
+          <BarcodeIcon className="w-3.5 h-3.5 shrink-0" />
+          <span>{scanFeedback.msg}</span>
+        </div>
+      )}
+
+      {/* Header bar */}
+      <div className="p-6 rounded-3xl bg-surface backdrop-blur-xl border border-border shadow-xl flex justify-between items-center flex-wrap gap-4 text-text">
+        <div>
+          <h3 className="text-base font-bold text-text flex items-center gap-2">
+            <div className="w-8 h-8 rounded-xl bg-blue-500/20 border border-blue-500/30 flex items-center justify-center text-blue-600 dark:text-blue-400">
+              <Boxes className="w-4 h-4" />
+            </div>
+            <span>{t('inventory.heroTitle')}</span>
+          </h3>
+          <p className="text-xs text-text-muted mt-1">{t('inventory.heroSubtitle')}</p>
+        </div>
+
+        <div className="flex items-center gap-2.5 flex-wrap">
+          {medicines.length > 0 && (
+            <button
+              id="btn-clear-all-stock"
+              onClick={handleClearAllInventory}
+              className="bg-danger/15 hover:bg-danger/25 text-danger border border-danger/30 font-semibold px-3 py-2 rounded-2xl text-xs flex items-center gap-1.5 backdrop-blur-md transition cursor-pointer"
+              title={t('inventory.deleteAllTitle2')}
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>{t('inventory.clearAll')}</span>
+            </button>
+          )}
+
+          <button
+            onClick={onOpenDistributorsModal}
+            className="bg-surface-elevated hover:bg-border text-text border border-border font-semibold px-3.5 py-2 rounded-2xl text-xs flex items-center gap-1.5 backdrop-blur-md transition cursor-pointer"
+          >
+            <Truck className="w-3.5 h-3.5 text-primary" />
+            <span>{t('inventory.manageDistributors')}</span>
+          </button>
+
+          <button
+            onClick={onOpenManageGroupsModal}
+            className="bg-surface-elevated hover:bg-border text-text border border-border font-semibold px-3.5 py-2 rounded-2xl text-xs flex items-center gap-1.5 backdrop-blur-md transition cursor-pointer"
+          >
+            <Tags className="w-3.5 h-3.5 text-primary" />
+            <span>{t('inventory.manageGroups')}</span>
+          </button>
+
+          <button
+            onClick={handleExportCSV}
+            className="bg-success hover:brightness-105 text-primary-foreground font-bold px-3.5 py-2 rounded-2xl text-xs flex items-center gap-1.5 shadow-lg transition cursor-pointer"
+          >
+            <Download className="w-3.5 h-3.5" />
+            <span>{t('inventory.exportExcel')}</span>
+          </button>
+
+          <button
+            id="btn-import-stock"
+            onClick={() => setShowImportModal(true)}
+            className="bg-surface-elevated hover:bg-border text-text border border-border font-semibold px-3.5 py-2 rounded-2xl text-xs flex items-center gap-1.5 backdrop-blur-md transition cursor-pointer"
+          >
+            <Upload className="w-3.5 h-3.5 text-primary" />
+            <span>{t('inventory.importFile')}</span>
+          </button>
+
+          {/* ADD NEW STOCK BUTTON */}
+          <button
+            id="btn-add-new-stock"
+            onClick={onOpenAddStockModal}
+            className="bg-primary hover:bg-primary-hover text-primary-foreground px-4 py-2 rounded-2xl text-xs font-bold flex items-center gap-1.5 shadow-lg shadow-primary/30 transition cursor-pointer"
+          >
+            <Plus className="w-4 h-4" />
+            <span>{t('inventory.addStock')}</span>
+          </button>
+
+          {/* ADD NEW LAB STOCK BUTTON (NEXT TO ADD NEW STOCK) */}
+          <button
+            id="btn-add-new-lab-stock"
+            onClick={onOpenAddLabStockModal}
+            className="bg-accent hover:brightness-105 text-primary-foreground px-4 py-2 rounded-2xl text-xs font-bold flex items-center gap-1.5 shadow-lg border border-accent/40 transition cursor-pointer"
+          >
+            <FlaskConical className="w-4 h-4" />
+            <span>{t('inventory.addLabStock')}</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Metric summary banner */}
+      <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+        <div className="p-5 rounded-3xl bg-surface backdrop-blur-xl border border-border shadow-xl flex justify-between items-center text-text">
+          <div>
+            <p className="text-xs font-medium text-text-muted">{t('inventory.totalMedicineSkus')}</p>
+            <h4 className="text-lg font-bold text-text font-mono mt-1">
+              {physicalMeds.length} Items ({totalStockUnits} Units)
+            </h4>
+          </div>
+          <div className="w-10 h-10 rounded-2xl bg-primary/15 border border-primary/30 text-primary flex items-center justify-center">
+            <Boxes className="w-5 h-5" />
+          </div>
+        </div>
+
+        <div className="p-5 rounded-3xl bg-surface backdrop-blur-xl border border-border shadow-xl flex justify-between items-center text-text">
+          <div>
+            <p className="text-xs font-medium text-text-muted">{t('inventory.labTestSkus')}</p>
+            <h4 className="text-lg font-bold text-text font-mono mt-1">
+              {labItems.length} Tests / Services
+            </h4>
+          </div>
+          <div className="w-10 h-10 rounded-2xl bg-accent/15 border border-accent/30 text-accent flex items-center justify-center">
+            <FlaskConical className="w-5 h-5" />
+          </div>
+        </div>
+
+        <div className="p-5 rounded-3xl bg-surface backdrop-blur-xl border border-border shadow-xl flex justify-between items-center text-text">
+          <div>
+            <p className="text-xs font-medium text-text-muted">{t('inventory.purchaseValuation')}</p>
+            <h4 className="text-lg font-bold text-warning font-mono mt-1">
+              {formatMoney(totalValuation)}
+            </h4>
+          </div>
+          <div className="w-10 h-10 rounded-2xl bg-warning/15 border border-warning/30 text-warning flex items-center justify-center">
+            <Coins className="w-5 h-5" />
+          </div>
+        </div>
+
+        <div className="p-5 rounded-3xl bg-surface backdrop-blur-xl border border-border shadow-xl flex justify-between items-center text-text">
+          <div>
+            <p className="text-xs font-medium text-text-muted">{t('inventory.retailValue')}</p>
+            <h4 className="text-lg font-bold text-success font-mono mt-1">
+              {formatMoney(totalRetailValue)}
+            </h4>
+          </div>
+          <div className="w-10 h-10 rounded-2xl bg-success/15 border border-success/30 text-success flex items-center justify-center">
+            <Coins className="w-5 h-5" />
+          </div>
+        </div>
+      </div>
+
+      {/* Filter toolbar */}
+      <div className="flex justify-between items-center flex-wrap gap-3">
+        <div className="flex gap-1 p-1 bg-surface border border-border rounded-2xl backdrop-blur-md flex-wrap">
+          <button
+            onClick={() => setFilterType('all')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer ${
+              filterType === 'all'
+                ? 'bg-primary text-primary-foreground shadow-md shadow-primary/30'
+                : 'text-text-muted hover:text-text'
+            }`}
+          >
+            All Stock ({medicines.length})
+          </button>
+          <button
+            onClick={() => setFilterType('meds')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer ${
+              filterType === 'meds'
+                ? 'bg-blue-600 text-text shadow-md'
+                : 'text-text-muted hover:text-text'
+            }`}
+          >
+            Medicines Only ({physicalMeds.length})
+          </button>
+          <button
+            onClick={() => setFilterType('labs')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer ${
+              filterType === 'labs'
+                ? 'bg-purple-600 text-text shadow-md'
+                : 'text-text-muted hover:text-text'
+            }`}
+          >
+            Lab Tests & Services ({labItems.length})
+          </button>
+          <button
+            onClick={() => setFilterType('low')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer ${
+              filterType === 'low'
+                ? 'bg-rose-600 text-text shadow-md'
+                : 'text-text-muted hover:text-text'
+            }`}
+          >{t('inventory.lowStock')}</button>
+          {filterType === 'low' && (
+            <button
+              onClick={onOpenLowStockReorderModal}
+              className="px-3 py-1.5 rounded-xl text-xs font-bold bg-rose-600 hover:bg-rose-500 text-text shadow-md flex items-center gap-1.5 cursor-pointer"
+            >
+              <ShoppingCart className="w-3.5 h-3.5" />
+              <span>{t('inventory.bulkReorder')}</span>
+            </button>
+          )}
+          <button
+            onClick={() => setFilterType('expiry')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer ${
+              filterType === 'expiry'
+                ? 'bg-amber-600 text-text shadow-md'
+                : 'text-text-muted hover:text-text'
+            }`}
+          >{t('inventory.shortExpiry')}</button>
+        </div>
+
+        <div className="relative">
+          <Search className="w-3.5 h-3.5 text-text-muted absolute left-3 top-3" />
+          <input
+            type="text"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            placeholder={t('inventory.searchPlaceholder')}
+            className="pl-9 pr-3 py-2 bg-surface border border-border rounded-2xl text-xs w-72 text-text placeholder:text-text-muted outline-none focus:border-primary backdrop-blur-md"
+          />
+        </div>
+      </div>
+
+      {/* Inventory table */}
+      <div className="bg-surface backdrop-blur-xl border border-border rounded-3xl shadow-xl overflow-x-auto text-xs text-text">
+        <table className="w-full text-left border-collapse min-w-[1050px]">
+          <thead className="bg-surface-elevated border-b border-border text-[11px] font-semibold text-text-muted uppercase sticky top-0 backdrop-blur-md">
+            <tr>
+              <th className="p-3.5">{t('inventory.itemNameBrand')}</th>
+              <th className="p-3.5">{t('inventory.saltParameter')}</th>
+              <th className="p-3.5">{t('inventory.categorySupplier')}</th>
+              <th className="p-3.5">{t('inventory.stockTracking')}</th>
+              <th className="p-3.5">{t('inventory.oldMrp')}</th>
+              <th className="p-3.5">{t('inventory.sellingMrp')}</th>
+              <th className="p-3.5">{t('inventory.purchaseCost')}</th>
+              <th className="p-3.5">{t('inventory.gstAndDisc')}</th>
+              <th className="p-3.5 font-bold text-text">{t('inventory.stockValuation')}</th>
+              <th className="p-3.5">{t('inventory.expiryValidity')}</th>
+              <th className="p-3.5">{t('inventory.rackChamber')}</th>
+              <th className="p-3.5 text-right">{t('inventory.actions')}</th>
+            </tr>
+          </thead>
+          <tbody id="inventory-table-rows" className="divide-y divide-border text-text">
+            {filtered.length === 0 ? (
+              <tr>
+                <td colSpan={12} className="p-8 text-center text-text-muted">{t('inventory.noItems')}</td>
+              </tr>
+            ) : (
+              filtered.map(i => {
+                const isLab = i.isLabTest || i.itemType === 'lab_test';
+                const isLow = !isLab && i.stock <= 10;
+                const isShortExpiry = !isLab && i.expiry <= '2026-12';
+                const stockVal = isLab
+                  ? (i.trackStock ? (i.rate || i.mrp * 0.5) * i.stock : 0)
+                  : (i.rate || i.mrp * 0.7) * i.stock;
+
+                return (
+                  <tr
+                    key={i.id}
+                    className={`hover:bg-surface transition ${
+                      isLab ? 'bg-purple-950/10 hover:bg-purple-900/20' : ''
+                    }`}
+                  >
+                    <td className="p-3.5">
+                      <div className="flex items-center gap-1.5">
+                        {isLab && (
+                          <span className="w-5 h-5 rounded-md bg-purple-500/20 border border-purple-500/30 flex items-center justify-center text-purple-700 dark:text-purple-300 shrink-0">
+                            <FlaskConical className="w-3 h-3" />
+                          </span>
+                        )}
+                        <span className="font-bold text-text block">{i.name}</span>
+                      </div>
+                      <span className="text-[10px] text-text-muted flex items-center gap-1.5 mt-0.5">
+                        <span className="text-purple-700 dark:text-purple-300 font-semibold">{i.company || 'Standard'}</span>
+                        <span>•</span>
+                        <span>{t('inventory.packLabel')}<b className="text-text-muted">{i.pack || (isLab ? t('inventory.oneTest') : '10*T')}</b></span>
+                        {isLab && (
+                          <span className="px-1.5 py-0.2 rounded bg-purple-500/20 text-purple-700 dark:text-purple-300 text-[9px] font-bold">{t('inventory.labItem')}</span>
+                        )}
+                      </span>
+                    </td>
+
+                    <td className="p-3.5 text-text-muted max-w-[200px]">
+                      <span className="text-[11px] font-medium leading-snug line-clamp-2">
+                        {i.salt || 'N/A'}
+                      </span>
+                    </td>
+
+                    <td className="p-3.5 font-medium text-primary">
+                      {i.dist || i.group}
+                    </td>
+
+                    {/* Stock Units / Tracking */}
+                    <td className="p-3.5 font-bold font-mono">
+                      {isLab ? (
+                        i.trackStock ? (
+                          <span className="px-2.5 py-1 rounded-full text-xs bg-purple-500/20 text-purple-700 dark:text-purple-300 border border-purple-500/30">
+                            {i.stock} Kits (Tracked)
+                          </span>
+                        ) : (
+                          <span className="px-2.5 py-1 rounded-full text-xs bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30 flex items-center gap-1 w-fit">
+                            <span>{t('inventory.serviceNoLimit')}</span>
+                          </span>
+                        )
+                      ) : (
+                        <span
+                          className={`px-2.5 py-1 rounded-full text-xs ${
+                            isLow
+                              ? 'bg-rose-500/20 text-rose-700 dark:text-rose-300 border border-rose-500/30'
+                              : 'bg-surface-elevated text-text border border-border'
+                          }`}
+                        >
+                          {i.stock} Units
+                        </span>
+                      )}
+                    </td>
+
+                    <td className="p-3.5 font-mono text-text-muted">
+                      {formatMoney((i.omrp || 0))}
+                    </td>
+
+                    <td className="p-3.5 font-bold font-mono text-text">
+                      {formatMoney(i.mrp)}
+                    </td>
+
+                    <td className="p-3.5 font-mono text-emerald-600 dark:text-emerald-400 font-bold">
+                      {formatMoney((i.rate || 0))}
+                    </td>
+
+                    <td className="p-3.5 text-[11px] font-mono text-text-muted">
+                      {i.gst || 0}% / {i.disc || 0}%
+                    </td>
+
+                    <td className="p-3.5 font-mono font-bold text-primary bg-surface">
+                      {isLab && !i.trackStock ? (
+                        <span className="text-text-muted font-normal text-[11px]">{t('inventory.serviceCharge')}</span>
+                      ) : (
+                        `${formatMoney(stockVal)}`
+                      )}
+                    </td>
+
+                    <td
+                      className={`p-3.5 font-mono font-semibold ${
+                        isShortExpiry ? 'text-amber-700 dark:text-amber-300 bg-amber-500/10 font-bold' : 'text-text-muted'
+                      }`}
+                    >
+                      {isLab ? (
+                        <span className="text-emerald-600 dark:text-emerald-400 font-semibold text-[11px]">{t('inventory.activeService')}</span>
+                      ) : (
+                        <>
+                          {i.expiry}
+                          {isShortExpiry && (
+                            <span className="block text-[9px] text-amber-600 dark:text-amber-400 font-bold uppercase">{t('inventory.expiringSoon')}</span>
+                          )}
+                        </>
+                      )}
+                    </td>
+
+                    <td className="p-3.5">
+                      <span className={`font-mono px-2.5 py-1 rounded-lg border text-[11px] ${
+                        isLab
+                          ? 'bg-purple-500/15 border-purple-500/30 text-purple-800 dark:text-purple-200'
+                          : 'bg-surface-elevated border-border text-text-muted'
+                      }`}>
+                        {i.rack || (isLab ? 'LAB-CHAMBER' : 'RACK-A1')}
+                      </span>
+                    </td>
+
+                    <td className="p-3.5 text-right">
+                      <div className="flex items-center justify-end gap-1.5">
+                        <button
+                          onClick={() => setEditTargetId(i.id)}
+                          className="p-1.5 rounded-lg bg-emerald-500/10 hover:bg-emerald-500/30 text-emerald-600 dark:text-emerald-400 transition border border-emerald-500/20"
+                          title={`Edit ${i.name}`}
+                        >
+                          <Pencil className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          onClick={() => setBarcodeTargetId(i.id)}
+                          className="p-1.5 rounded-lg bg-primary/10 hover:bg-primary/30 text-primary transition border border-primary/20"
+                          title={`Barcode for ${i.name}`}
+                        >
+                          <BarcodeIcon className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          onClick={() => handleDeleteItem(i.id, i.name)}
+                          className="p-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/30 text-rose-600 dark:text-rose-400 hover:text-rose-800 dark:hover:text-rose-200 transition border border-rose-500/20"
+                          title={`Delete ${i.name}`}
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <BarcodeModal
+        isOpen={!!barcodeTarget}
+        onClose={() => setBarcodeTargetId(null)}
+        medicine={barcodeTarget}
+        medicines={medicines}
+        setMedicines={setMedicines}
+      />
+
+      <EditStockModal
+        isOpen={!!editTarget}
+        medicine={editTarget}
+        invoiceCurrency={invoiceConfig?.currency}
+        onClose={() => setEditTargetId(null)}
+        onSave={updated => {
+          if (!setMedicines) return;
+          setMedicines(prev => prev.map(m => (m.id === updated.id ? updated : m)));
+        }}
+      />
+
+      <ImportStockModal
+        isOpen={showImportModal}
+        onClose={() => setShowImportModal(false)}
+        onImport={imported => {
+          if (setMedicines) setMedicines(prev => [...imported, ...prev]);
+        }}
+      />
+    </div>
+  );
+};
+

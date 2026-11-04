@@ -1,0 +1,2028 @@
+import React, { useEffect, useRef, useState } from 'react';
+import {
+  AlertCircle,
+  Building2,
+  Calendar,
+  Camera,
+  Check,
+  CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  Clipboard,
+  Coins,
+  Copy,
+  DollarSign,
+  Download,
+  Edit3,
+  Eye,
+  FileCheck,
+  FileSpreadsheet,
+  FileText,
+  Filter,
+  History,
+  Layers,
+  Loader2,
+  Package,
+  PackageCheck,
+  PackagePlus,
+  Percent,
+  Phone,
+  Plus,
+  Printer,
+  RefreshCw,
+  RotateCcw,
+  Save,
+  Scan,
+  ScanLine,
+  Search,
+  ShieldAlert,
+  ShieldCheck,
+  Sparkles,
+  Store,
+  Tag,
+  Trash2,
+  TrendingUp,
+  Truck,
+  Upload,
+  UploadCloud,
+  X,
+  Zap,
+} from 'lucide-react';
+import { Distributor, ExpenseRecord, InvoiceConfig, Medicine } from '../../types';
+import { exportToCSV } from '../../utils/exportCsv';
+import { formatFullDateWithDay, getTodayISODate } from '../../utils/dateUtils';
+import { ocrApi } from '../../lib/api';
+import { getCurrencySymbol, formatMoney } from '../../utils/currency';
+import { recognizeIdText } from '../../utils/patientIdOcr';
+import { isPuterOcrEnabled, recognizeWithPuter, setPuterOcrEnabled } from '../../utils/puterOcr';
+
+// Copy/paste prompt for the "Paste Text" input method: the user pastes this
+// into any free AI chat (ChatGPT, Gemini, Claude, Copilot, Meta AI, etc. —
+// no API key needed, just the normal free web chat) along with a photo/PDF
+// of the bill, then pastes the AI's reply back into the textarea below. The
+// output format here is deliberately identical to parseInvoiceTextLocally's
+// labeled-line format (DISTRIBUTOR:/GSTIN:/Phone:/INV NO: headers, then
+// "Name, Qty: x, Rate: x, MRP: x, Batch: x, Exp: YYYY-MM, Pack: x" per item)
+// so the pasted reply parses straight through with no manual reformatting.
+const AI_EXTRACTION_PROMPT = `You are extracting data from a pharmacy purchase/supplier bill (photo or PDF) so it can be imported into inventory software.
+
+Read the attached bill and reply with ONLY the data below in this EXACT plain-text format — no markdown, no tables, no extra commentary before or after it:
+
+DISTRIBUTOR: <supplier/distributor company name printed on the bill>
+GSTIN: <GSTIN number, or N/A if not visible>
+Phone: <phone/mobile number, or N/A>
+Address: <distributor's full printed address/depot location, or N/A>
+DL No: <drug license / D.L. number, or N/A>
+INV NO: <invoice/bill number>
+Date: <invoice date, YYYY-MM-DD>
+
+Then list every medicine line item, one per line, numbered, in this exact format:
+1. <Medicine Name>, Qty: <quantity>, Rate: <purchase rate per unit>, MRP: <MRP>, Batch: <batch number>, Exp: <expiry as YYYY-MM>, Pack: <pack size e.g. 10*10>
+
+Rules:
+- One line per medicine, nothing else on that line.
+- Keep the exact labels "Qty:", "Rate:", "MRP:", "Batch:", "Exp:", "Pack:" with their colons.
+- Do not skip any item row, including ones with 0 discount or 0 scheme.
+- If a field isn't printed on the bill, write N/A for that field but keep the label.
+- Do not include totals, GST breakup, or terms & conditions as item lines.
+- Do not wrap the output in a code block or add any explanation before/after it.
+
+After you give me this, I will copy your entire reply and paste it into my inventory app.`;
+
+interface ScannedInvoiceItem {
+  id?: string;
+  name: string;
+  company: string;
+  salt: string;
+  pack: string;
+  hsn: string;
+  batch: string;
+  exp: string; // YYYY-MM
+  qty: number;
+  rate: number;
+  dmrp?: number;
+  mrp: number;
+  scheme?: string;
+  disc?: number;
+  gst: number;
+  rack?: string;
+  tabsPerStrip?: number;
+  isNewMedicine?: boolean;
+}
+
+interface ScannedInvoiceData {
+  distributor: string;
+  gstin: string;
+  phone: string;
+  address: string;
+  dlNo: string;
+  invNo: string;
+  invDate: string;
+  totalCost: number;
+  items: ScannedInvoiceItem[];
+  isNewDistributor?: boolean;
+  skippedRowCount?: number;
+}
+
+interface InwardOCRTabProps {
+  distributors: Distributor[];
+  setDistributors: React.Dispatch<React.SetStateAction<Distributor[]>>;
+  medicines: Medicine[];
+  setMedicines: React.Dispatch<React.SetStateAction<Medicine[]>>;
+  invoiceConfig: InvoiceConfig;
+  expenses?: ExpenseRecord[];
+  setExpenses?: React.Dispatch<React.SetStateAction<ExpenseRecord[]>>;
+}
+
+export const InwardOCRTab: React.FC<InwardOCRTabProps> = ({
+  distributors,
+  setDistributors,
+  medicines,
+  setMedicines,
+  invoiceConfig,
+  expenses,
+  setExpenses,
+}) => {
+  const currencySymbol = getCurrencySymbol(invoiceConfig.currency);
+
+  // Current UI state
+  const [activeInputMethod, setActiveInputMethod] = useState<'upload' | 'camera' | 'paste'>('upload');
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [errorNotice, setErrorNotice] = useState<string | null>(null);
+  const [successNotice, setSuccessNotice] = useState<string | null>(null);
+  const [puterOcrEnabled, setPuterOcrEnabledState] = useState<boolean>(isPuterOcrEnabled());
+
+  const handleTogglePuterOcr = () => {
+    const next = !puterOcrEnabled;
+    setPuterOcrEnabledState(next);
+    setPuterOcrEnabled(next);
+  };
+
+  // Active scanned result workspace
+  const [scannedResult, setScannedResult] = useState<ScannedInvoiceData | null>(null);
+  const [previewImage, setPreviewImage] = useState<string | null>(null);
+  const [isCommitted, setIsCommitted] = useState<boolean>(false);
+  const [logAsExpense, setLogAsExpense] = useState<boolean>(false);
+
+  // Edit modal / inline edit state
+  const [editingItemIdx, setEditingItemIdx] = useState<number | null>(null);
+  const [editFormData, setEditFormData] = useState<ScannedInvoiceItem | null>(null);
+  const [searchFilter, setSearchFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'new' | 'existing'>('all');
+
+  // Past Inward Log History (session memory)
+  const [inwardHistory, setInwardHistory] = useState<
+    Array<{
+      id: string;
+      date: string;
+      distributor: string;
+      invNo: string;
+      itemCount: number;
+      newMedsCount: number;
+      totalCost: number;
+      timestamp: string;
+    }>
+  >([]);
+
+  // Camera state
+  const [isCameraActive, setIsCameraActive] = useState(false);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+
+  // Paste Text state
+  const [pastedText, setPastedText] = useState('');
+  const [promptCopied, setPromptCopied] = useState(false);
+
+  const handleCopyAiPrompt = async () => {
+    try {
+      await navigator.clipboard.writeText(AI_EXTRACTION_PROMPT);
+    } catch {
+      // Clipboard API unavailable/blocked (older browser, insecure context) —
+      // fall back to the classic hidden-textarea + execCommand copy trick.
+      const helper = document.createElement('textarea');
+      helper.value = AI_EXTRACTION_PROMPT;
+      helper.style.position = 'fixed';
+      helper.style.opacity = '0';
+      document.body.appendChild(helper);
+      helper.select();
+      document.execCommand('copy');
+      document.body.removeChild(helper);
+    }
+    setPromptCopied(true);
+    setTimeout(() => setPromptCopied(false), 2500);
+  };
+
+  // -------------------------------------------------------------
+  // HELPER: Local smart text parser for raw pasted invoice text
+  // -------------------------------------------------------------
+  // Lines that are almost certainly letterhead/header/footer/totals rather
+  // than a medicine row — checked before treating any line as an item, in
+  // both the labeled-field and whitespace-tabular branches below, so scanned
+  // address/GST-summary lines don't get mistaken for a purchased item.
+  // No leading `^`: OCR often prepends garbled noise before the real
+  // keyword (e.g. a signature scrawl smearing into "...LESS RET/CR NOTE"),
+  // which would otherwise slip past an anchored match and get scraped in
+  // as a fake medicine line — reproduced against a real scanned invoice.
+  const nonItemLinePattern =
+    /(qty|packing|description|hsn|omrp|batch|exp\s?dt|mrp|rate|disc|schem|gst\s?%|amount|gross\s?amount|net\s?am[tn]|\bless\b|add\s?[cs]gst|[cs]gst\s?@|rupees|no\.\s?of\s?items|challan|jurisdiction|for\s+new|subject\s+to|e\.\s?&\s?o\.?e|m\/s|gstin|dl\s?no|ph(one)?[:.]|email|cash|user\s?:|time\s?:|inv\s?no|date\s?:|gst\s?invoice)/i;
+
+  const parseInvoiceTextLocally = (text: string): ScannedInvoiceData | null => {
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    if (lines.length === 0) return null;
+
+    let distributor = 'SUPPLIER DISTRIBUTOR';
+    let gstin = 'N/A';
+    let phone = 'N/A';
+    let address = 'N/A';
+    let dlNo = 'N/A';
+    let invNo = 'INV-' + Math.floor(100000 + Math.random() * 900000);
+    let invDate = getTodayISODate();
+    const items: ScannedInvoiceItem[] = [];
+    // Counts rows that looked like a medicine line but produced numbers
+    // outside any plausible range for retail pharma pricing/quantity —
+    // almost always OCR dropping a decimal point off a photographed
+    // table (e.g. "205.31" read as "20531"). Surfaced to the user rather
+    // than silently either committing a corrupted stock entry or silently
+    // dropping a real line with no trace.
+    let skippedRowCount = 0;
+
+    // Whole-text scan for a structurally valid GSTIN and an Indian mobile
+    // number — these have a fixed, unambiguous format, so this catches them
+    // on printed/scanned bills even without a "GSTIN:"/"Phone:" label,
+    // which raw OCR output usually doesn't preserve.
+    const gstinMatch = text.match(/\b\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]\b/);
+    if (gstinMatch) gstin = gstinMatch[0];
+    const phoneMatch = text.match(/(?:\+?91[\s-]?|0)?\b([6-9]\d{9})\b/);
+    if (phoneMatch) phone = phoneMatch[1];
+
+    // Drug license numbers are near-freeform, so only trust an explicit
+    // "DL No" / "Drug Licence" label rather than guessing from a bare
+    // alphanumeric string (same approach as utils/distributorOcr.ts).
+    const dlMatch = text.match(/(?:drug\s*licen[cs]e|d\.?l\.?)\s*(?:no\.?)?\s*[:.-]?\s*([A-Za-z0-9/-]{5,20})/i);
+    if (dlMatch) dlNo = dlMatch[1];
+
+    // Address has no unambiguous format to scan for, so this only trusts an
+    // explicit "Address:" label appearing anywhere in the text (paste-text /
+    // AI-prompt convention) — the per-line loop below also catches it as the
+    // first token on its own line.
+    const addrMatch = text.match(/\baddress\s*[:.-]\s*(.+)/i);
+    if (addrMatch) address = addrMatch[1].trim();
+
+    // Distributor letterhead is almost always near the top of a
+    // scanned/printed bill, but on-device OCR of a real photographed bill
+    // routinely prepends/appends stray punctuation to that line (commas,
+    // em-dashes, misread border rules — e.g. ", NEW UMA MEDICINE
+    // DISTRIBUTOR ——") or garbles the line entirely and pushes the real
+    // letterhead text to line 2 or 3 instead. Requiring an exact-shape
+    // match on `lines[0]` alone (the old behavior) silently fell back to
+    // the "SUPPLIER DISTRIBUTOR" placeholder on both of these real cases —
+    // reproduced against two real distributor invoices where the true
+    // letterhead ended up on lines[0] and lines[1] respectively, each with
+    // noise the strict first-line regex rejected outright.
+    // No trailing `\b`/full-word requirement: OCR on a real photographed
+    // letterhead routinely drops or mangles the last character or two of a
+    // word (verified against a real bill where "NEW UMA MEDICINE
+    // DISTRIBUTOR" came back as "...DISTRIBUTq", the trailing "OR" lost) —
+    // a strict full-word match missed that despite the line being otherwise
+    // correct, and fell through to a worse fallback candidate. These stems
+    // are distinctive enough that a prefix match still won't false-positive
+    // on an ordinary business/person name.
+    const distributorKeyword =
+      /\b(DISTRIBUT|PHARMA|REMED|AGENC|MEDICOS|ENTERPRISE|PHARMACEUTICAL|HEALTHCARE|LABORATOR)/i;
+    const cleanLetterheadCandidate = (line: string) =>
+      line
+        // Collapse any run of characters that isn't a letter/space/the
+        // handful of punctuation marks a real business name can contain
+        // (& . ' -) into a single space, rather than only trimming the
+        // start/end of the line — a misread border mid-line would
+        // otherwise permanently disqualify an otherwise-correct line.
+        .replace(/[^A-Za-z&.'-]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    // A short (<=2 char) leading token gets dropped only when it's NOT
+    // all-uppercase: real Indian business names routinely start with
+    // initials ("S. K. TRADERS") in the same all-caps style as the rest of
+    // the letterhead, while OCR noise tokens picked up from a misread
+    // border/rule ("n", "pe", "oh") come out lowercase/mixed-case — this
+    // clears the noise without eating a genuine initial.
+    const dropLeadingNoiseWords = (cleaned: string) => {
+      const words = cleaned.split(' ');
+      while (words.length > 1 && words[0].length <= 2 && words[0] !== words[0].toUpperCase()) {
+        words.shift();
+      }
+      return words.join(' ');
+    };
+
+    let distributorFound = false;
+    let fallbackCandidate = '';
+    for (const rawLine of lines.slice(0, 8)) {
+      if (nonItemLinePattern.test(rawLine)) continue;
+      const cleaned = dropLeadingNoiseWords(cleanLetterheadCandidate(rawLine));
+      if (!cleaned || cleaned.length < 5 || cleaned.length > 60 || !/[A-Za-z]{3,}/.test(cleaned)) continue;
+      // Prefer a line that actually contains a distributor-shaped keyword
+      // over the first plausible-looking line, since a photographed bill's
+      // buyer name (e.g. "M/s MRS MEDICAL") is just as likely to survive
+      // OCR cleanly and would otherwise win by appearing first.
+      if (distributorKeyword.test(cleaned)) {
+        distributor = cleaned;
+        distributorFound = true;
+        break;
+      }
+      if (!fallbackCandidate) fallbackCandidate = cleaned;
+    }
+    if (!distributorFound && fallbackCandidate) distributor = fallbackCandidate;
+
+    lines.forEach(line => {
+      const lower = line.toLowerCase();
+      if (lower.startsWith('distributor:') || lower.startsWith('supplier:') || lower.startsWith('agency:')) {
+        distributor = line.split(':')[1]?.trim() || distributor;
+      } else if (lower.includes('gstin:') || lower.includes('gst:')) {
+        const match = line.match(/gstin?:\s*([A-Za-z0-9]+)/i);
+        if (match) gstin = match[1];
+      } else if (lower.includes('phone:') || lower.includes('mobile:') || lower.includes('tel:')) {
+        const match = line.match(/(?:phone|mobile|tel):\s*([\+0-9\s-]+)/i);
+        if (match) phone = match[1].trim();
+      } else if (lower.includes('address:')) {
+        const val = line.split(':').slice(1).join(':').trim();
+        if (val) address = val;
+      } else if (lower.includes('dl no:') || lower.includes('dl no.') || lower.includes('license:') || lower.includes('licence:')) {
+        const match = line.match(/(?:dl\s*no\.?|licen[cs]e)\s*[:.-]?\s*([A-Za-z0-9/-]{3,20})/i);
+        if (match) dlNo = match[1].trim();
+      } else if (lower.includes('inv no:') || lower.includes('invoice:')) {
+        const match = line.match(/(?:inv no|invoice):\s*([A-Za-z0-9-]+)/i);
+        if (match) invNo = match[1].trim();
+      } else {
+        // Route by whether this line actually uses the manual "Name, qty:
+        // 10, rate: 25, ..." label format (the paste-text convention), not
+        // by mere presence of a comma/pipe/tab — scanned/OCR'd invoices
+        // routinely have stray "|" and "[" characters left over from table
+        // borders, which would otherwise be misread as real field
+        // separators and garble the item name.
+        const isLabeledFormat = /\b(qty|rate|mrp|batch|exp|pack)\s*:/i.test(line);
+        const parts = isLabeledFormat ? line.split(/[,\t|]/).map(p => p.trim()) : [line];
+        if (isLabeledFormat && parts.length >= 2) {
+          const rawName = parts[0].replace(/^[0-9]+[\.\)]\s*/, '').trim();
+          if (
+            rawName &&
+            !nonItemLinePattern.test(rawName) &&
+            !rawName.toLowerCase().startsWith('total') &&
+            !rawName.toLowerCase().startsWith('date') &&
+            !rawName.toLowerCase().startsWith('grand')
+          ) {
+            let qty = 10;
+            let rate = 50;
+            let mrp = 75;
+            let batch = 'B-' + Math.floor(1000 + Math.random() * 9000);
+            let exp = '2028-12';
+            let pack = '10*T';
+
+            parts.slice(1).forEach(p => {
+              const pLower = p.toLowerCase();
+              if (pLower.includes('qty:')) qty = parseFloat(p.split(':')[1]) || qty;
+              else if (pLower.includes('rate:')) rate = parseFloat(p.split(':')[1]) || rate;
+              else if (pLower.includes('mrp:')) mrp = parseFloat(p.split(':')[1]) || mrp;
+              else if (pLower.includes('batch:')) batch = p.split(':')[1]?.trim() || batch;
+              else if (pLower.includes('exp:')) exp = p.split(':')[1]?.trim() || exp;
+              else if (pLower.includes('pack:')) pack = p.split(':')[1]?.trim() || pack;
+              else if (!isNaN(parseFloat(p))) {
+                if (qty === 10) qty = parseFloat(p);
+                else if (rate === 50) rate = parseFloat(p);
+                else if (mrp === 75) mrp = parseFloat(p);
+              }
+            });
+
+            items.push({
+              name: rawName.toUpperCase(),
+              pack,
+              hsn: '300490',
+              dmrp: 0,
+              batch,
+              exp,
+              mrp,
+              rate,
+              disc: 0,
+              scheme: '0.00',
+              gst: 12,
+              qty,
+              salt: 'Pharma Formulation',
+              company: distributor.split(' ')[0] || 'Pharma',
+              rack: 'RACK-GEN',
+              tabsPerStrip: 10,
+            });
+          }
+        } else if (!isLabeledFormat && !nonItemLinePattern.test(line) && /[A-Za-z]{3,}/.test(line) && /\d/.test(line)) {
+          // Whitespace-tabular row — the shape raw OCR of a printed
+          // distributor invoice table produces, e.g.:
+          // "3 10'S S-VOCITA LS TAB 300490 205.31 77S25T01 04/27 205.31 156.43 4.00 0.00 5% 450.52"
+          // (Qty, Pack, Description, HSN, OMRP, Batch, ExpDt, MRP, Rate,
+          // Disc%, Scheme%, GST%, Amount), often with leftover "|"/"["/"]"
+          // table-border marks OCR picks up between columns.
+          //
+          // The expiry date is the one column whose shape is completely
+          // unambiguous (dd/mm-style, month 1-12), so it anchors everything
+          // else: on a real Indian pharma invoice MRP and Rate are always
+          // the two numbers immediately after it, in that order — this was
+          // verified against real scanned bills from multiple distributors.
+          // Picking "the two largest numbers in the whole line" instead
+          // (an earlier version of this parser) silently grabbed Amount
+          // and OMRP instead of MRP/Rate whenever a line had more than two
+          // price-shaped numbers (which is every line in this exact
+          // column layout) — inflating totalCost by 40-60% and was never
+          // caught because each individual number still looked plausible.
+          // Only when no date token is found does this fall back to that
+          // old magnitude-guess, so a differently-laid-out invoice still
+          // gets *something* rather than the row being dropped outright.
+          const cleanedLine = line.replace(/[|[\]]/g, ' ');
+          const tokens = cleanedLine.split(/\s+/).filter(Boolean);
+
+          // A genuine row in this column layout (Qty/Pack/Description/HSN/
+          // OMRP/Batch/ExpDt/MRP/Rate/Disc%/Scheme%/GST%/Amount) always has
+          // well over half a dozen tokens, even when OCR mangles individual
+          // characters within them. The outer gate above only checks for
+          // "one digit plus 3+ letters somewhere in the line", which a short
+          // burst of OCR noise off a logo/letterhead/border can satisfy just
+          // as easily as a real row — reproduced against a real scanned bill
+          // where garbled header noise ("4 a TEE") was accepted as a genuine
+          // line and silently created a fake "TEE" SKU (qty 4, rate ₹3) in
+          // live stock. Reject the line outright rather than guess columns
+          // out of too few tokens to plausibly be a real invoice row.
+          if (tokens.length < 6) {
+            skippedRowCount++;
+            return;
+          }
+
+          // A garbled table-HEADER row (Qty/Packing/Description/HSN/OMRP/
+          // Batch/ExpDt/...) can still land 6+ short tokens after OCR mangles
+          // every keyword beyond nonItemLinePattern's recognition, and by
+          // chance one of those fragments can contain a 3-letter run (e.g.
+          // "PRY") that satisfies the outer gate too — reproduced against a
+          // real scanned bill where "OY OY 9 PY 0 PRY PY" (the header row)
+          // was accepted as a genuine line. Every real data row, however,
+          // always carries at least one price column printed to 2 decimal
+          // places (MRP/Rate/Amount, even "0.00") — a header row never has
+          // one. Require it as a cheap, reliable real-row signal before
+          // trying to parse columns out of the line at all.
+          if (!tokens.some(tok => /^\d+\.\d{1,2}$/.test(tok))) {
+            skippedRowCount++;
+            return;
+          }
+
+          // Month must be 1-12: without this, a dosage fraction embedded in
+          // the drug name itself — e.g. "CILACAR T 20/40 TAB" — matches a
+          // bare dd/mm pattern and gets mistaken for the expiry date.
+          const expDatePattern = /^(0?[1-9]|1[0-2])[/-]\d{2,4}$/;
+          const expIdx = tokens.findIndex(tok => expDatePattern.test(tok));
+          const exp = expIdx >= 0 ? tokens[expIdx].replace(/-/g, '/') : '';
+
+          // HSN codes on these invoices are always a bare 6-digit integer
+          // (e.g. "300490", "300660") — distinct in shape from every price
+          // column, which is always a decimal (even "0.00"), so this never
+          // collides with OMRP/MRP/Rate.
+          const hsnIdx = tokens.findIndex((tok, i) => i >= 2 && /^\d{6}$/.test(tok));
+          const hsn = hsnIdx >= 0 ? tokens[hsnIdx] : '';
+
+          // Batch numbers are mixed alnum on most bills (e.g. "77S25T01")
+          // but purely numeric on some (e.g. "73240024") — a bare digit
+          // batch is indistinguishable by shape from a price column, so it
+          // only counts once we know it sits right before the expiry date
+          // (its fixed position in this layout). Candidates are only
+          // searched for *after* the HSN column, never in the qty/pack/name
+          // region before it — a dosage token embedded in the drug name
+          // itself (e.g. "PENTIDS 400MG TAB") otherwise matches this same
+          // alnum shape and gets mistaken for the batch, truncating the name.
+          let batch = hsnIdx >= 0
+            ? tokens.find(
+                (tok, i) => i > hsnIdx && /^[A-Za-z0-9]{5,12}$/.test(tok) && /[A-Za-z]/.test(tok) && /\d/.test(tok)
+              ) || ''
+            : tokens.find(
+                (tok, i) => i >= 2 && /^[A-Za-z0-9]{5,12}$/.test(tok) && /[A-Za-z]/.test(tok) && /\d/.test(tok)
+              ) || '';
+          if (!batch && expIdx > 2) {
+            const candidate = tokens[expIdx - 1];
+            if (candidate && candidate !== tokens[hsnIdx]) batch = candidate;
+          }
+
+          // Name is everything between the Pack column (always token[1])
+          // and the first of HSN/Batch/ExpDt found — deliberately including
+          // short/numeric-looking tokens ("D3", "LS", "MP", "20/40", "5mg")
+          // that the old shape-only filter dropped, since those are
+          // frequently the dosage/formulation suffix distinguishing two
+          // otherwise-identical drug names (e.g. "GEMER DS 4" vs "GEMER-P2").
+          const nameEndIdx = [hsnIdx, batch ? tokens.indexOf(batch) : -1, expIdx]
+            .filter(i => i > 1)
+            .reduce((min, i) => Math.min(min, i), tokens.length);
+
+          // If none of HSN/Batch/ExpDt were found at all, nameEndIdx never
+          // got bounded down from tokens.length — meaning "the name" would
+          // be every remaining token on the line, price columns included.
+          // Reproduced against a real scanned bill where exactly this
+          // happened and created a medicine literally named "SVOCITA LS TAR
+          // HOOTON 20831 77828701 04727 20831 15643 400 0.00 $% 40 52" (the
+          // entire raw line). Without at least one real anchor there's no
+          // reliable column boundary at all, for the name or the prices
+          // that would be guessed below — reject the row outright.
+          if (nameEndIdx >= tokens.length) {
+            skippedRowCount++;
+            return;
+          }
+
+          const rawName = tokens.slice(2, nameEndIdx).join(' ').trim();
+
+          const toNum = (tok: string) => parseFloat(tok.replace(/[%,]/g, ''));
+          const isNumericTok = (tok: string) => /^-?\d+(\.\d+)?%?$/.test(tok);
+
+          let mrp: number | undefined;
+          let rate: number | undefined;
+          let disc = 0;
+          let scheme = '0.00';
+          let gst = 12;
+          let dmrp = 0;
+
+          if (expIdx >= 0) {
+            const postExp = tokens.slice(expIdx + 1).filter(isNumericTok);
+            if (postExp[0] !== undefined) mrp = toNum(postExp[0]);
+            if (postExp[1] !== undefined) rate = toNum(postExp[1]);
+            if (postExp[2] !== undefined) disc = toNum(postExp[2]);
+            if (postExp[3] !== undefined) scheme = toNum(postExp[3]).toFixed(2);
+            // GST% is the only post-expiry column that reliably carries a
+            // literal "%" in the OCR text (Disc/Scheme usually print as a
+            // bare decimal on these bills) — Scheme still wins the position
+            // above when no "%" token is present at all.
+            const gstTok = postExp.find(tok => tok.includes('%'));
+            if (gstTok) gst = toNum(gstTok);
+            if (hsnIdx >= 0 && tokens[hsnIdx + 1] && isNumericTok(tokens[hsnIdx + 1]) && tokens[hsnIdx + 1] !== batch) {
+              dmrp = toNum(tokens[hsnIdx + 1]);
+            }
+          }
+
+          if (mrp === undefined || rate === undefined) {
+            // No expiry-date anchor found in this line — fall back to the
+            // old best-effort guess (largest two price-shaped numbers)
+            // rather than dropping a row from a differently-laid-out bill.
+            const priceCandidates = tokens.filter(isNumericTok).map(toNum).filter(n => n > 1 && n < 100000);
+            const sortedDesc = [...priceCandidates].sort((a, b) => b - a);
+            mrp = mrp ?? sortedDesc[0] ?? 75;
+            rate = rate ?? sortedDesc[1] ?? Math.round(mrp * 0.75 * 100) / 100;
+          }
+
+          // A real medicine name always has at least 3 actual letters — the
+          // previous `rawName.length >= 2` bar counted stray 2-char OCR
+          // fragments like "UR," (a mangled remnant of a real drug name,
+          // its real column boundaries lost) as an acceptable name and
+          // committed it as a live medicine. Requiring 3+ letters (not just
+          // 3+ characters — punctuation/digits alone shouldn't count) is
+          // well below the shortest real brand name on either real sample
+          // invoice (5+ letters each).
+          const rawNameLetterCount = (rawName.match(/[A-Za-z]/g) || []).length;
+          if (rawNameLetterCount >= 3) {
+            const qty = Math.round(toNum(tokens[0])) || 10;
+
+            // Recover a dropped decimal point on MRP/Rate specifically —
+            // not qty, which is a genuine small integer on every real
+            // sample invoice. Every real MRP/Rate on these bills is
+            // printed to exactly 2 decimal places; OCR merging "205.31"
+            // into "20531" (losing the point, not the digits) is common
+            // enough on real photographed bills that it isn't a rare edge
+            // case, and re-tested runs of the same real invoice show it
+            // happening on some passes and not others — a value over 5000
+            // is never a genuine strip price on any real sample seen
+            // (~₹1,000 max), so treating it as "the point that should be
+            // there landed 2 digits from the right" is a safe, narrow
+            // recovery: it only ever fires on a value that would otherwise
+            // be rejected outright, never overwrites an already-plausible
+            // reading.
+            if (mrp !== undefined && mrp > 5000 && mrp / 100 >= 0.5 && mrp / 100 <= 5000) {
+              mrp = Math.round(mrp) / 100;
+            }
+            if (rate !== undefined && rate > 5000 && rate / 100 >= 0.5 && rate / 100 <= 5000) {
+              rate = Math.round(rate) / 100;
+            }
+
+            // Plausibility guard: a single invoice line for one SKU is
+            // never actually thousands of units, and ₹5,000/strip is
+            // already 5x the highest genuine MRP seen across real sample
+            // invoices (~₹1,000) — values past these bounds (that the
+            // decimal-recovery step above couldn't explain either) are
+            // still rejected rather than guessed at further. Reject the
+            // whole row rather than commit a guessed number to a live
+            // pharmacy's inventory.
+            const qtyPlausible = qty >= 1 && qty <= 2000;
+            const mrpPlausible = mrp >= 0.5 && mrp <= 5000;
+            const ratePlausible = rate >= 0.5 && rate <= 5000;
+            if (!qtyPlausible || !mrpPlausible || !ratePlausible) {
+              skippedRowCount++;
+              return;
+            }
+
+            items.push({
+              name: rawName.toUpperCase(),
+              pack: tokens[1] || '10*T',
+              hsn: hsn || '300490',
+              dmrp,
+              batch: batch || 'B-' + Math.floor(1000 + Math.random() * 9000),
+              exp: exp || '2028-12',
+              mrp,
+              rate,
+              disc,
+              scheme,
+              gst,
+              qty,
+              salt: 'Pharma Formulation',
+              company: distributor.split(' ')[0] || 'Pharma',
+              rack: 'RACK-GEN',
+              tabsPerStrip: 10,
+            });
+          } else {
+            skippedRowCount++;
+          }
+        }
+      }
+    });
+
+    if (items.length === 0) return null;
+
+    const totalCost = items.reduce((acc, i) => acc + (i.rate * i.qty), 0);
+
+    return {
+      distributor,
+      gstin,
+      phone,
+      address,
+      dlNo,
+      invNo,
+      invDate,
+      totalCost,
+      items,
+      skippedRowCount,
+    };
+  };
+
+  // -------------------------------------------------------------
+  // RECONCILIATION HELPER: Check which items exist or are missing
+  // -------------------------------------------------------------
+  const reconcileScannedItems = (items: ScannedInvoiceItem[]): ScannedInvoiceItem[] => {
+    return items.map(item => {
+      const exists = medicines.some(
+        m =>
+          m.name.trim().toLowerCase() === item.name.trim().toLowerCase() ||
+          (item.batch && m.batch && m.batch.trim().toLowerCase() === item.batch.trim().toLowerCase())
+      );
+      return {
+        ...item,
+        isNewMedicine: !exists,
+      };
+    });
+  };
+
+  // -------------------------------------------------------------
+  // COMMIT INWARD INVOICE TO INVENTORY & DISTRIBUTORS
+  // -------------------------------------------------------------
+  const handleCommitToStock = (invoiceDataToCommit?: ScannedInvoiceData, confidenceNote?: string) => {
+    const data = invoiceDataToCommit || scannedResult;
+    if (!data) return;
+
+    // 1. REGISTER OR UPDATE DISTRIBUTOR
+    let isNewDist = false;
+    setDistributors(prev => {
+      const existingIdx = prev.findIndex(
+        d =>
+          d.name.trim().toLowerCase() === data.distributor.trim().toLowerCase() ||
+          (data.gstin && data.gstin !== 'N/A' && d.gstin && d.gstin.trim().toLowerCase() === data.gstin.trim().toLowerCase())
+      );
+
+      if (existingIdx >= 0) {
+        const updated = [...prev];
+        updated[existingIdx] = {
+          ...updated[existingIdx],
+          phone: data.phone && data.phone !== 'N/A' ? data.phone : updated[existingIdx].phone,
+          addr: data.address && data.address !== 'N/A' ? data.address : updated[existingIdx].addr,
+          gstin: data.gstin && data.gstin !== 'N/A' ? data.gstin : updated[existingIdx].gstin,
+          dlNo: data.dlNo && data.dlNo !== 'N/A' ? data.dlNo : updated[existingIdx].dlNo,
+        };
+        return updated;
+      } else {
+        isNewDist = true;
+        const newDistributor: Distributor = {
+          id: 'DIST-' + Date.now(),
+          name: data.distributor.trim().toUpperCase(),
+          gstin: data.gstin || 'N/A',
+          phone: data.phone || 'N/A',
+          addr: data.address || 'N/A',
+          dlNo: data.dlNo && data.dlNo !== 'N/A' ? data.dlNo : undefined,
+          registeredDate: getTodayISODate(),
+          source: 'OCR Purchase Bill',
+        };
+        return [newDistributor, ...prev];
+      }
+    });
+
+    // 2. MERGE / ADD MEDICINES INTO LIVE STOCK
+    let newMedsAddedCount = 0;
+    let existingMedsUpdatedCount = 0;
+
+    setMedicines(prev => {
+      const nextList = [...prev];
+
+      data.items.forEach((item, idx) => {
+        const existingIdx = nextList.findIndex(
+          m =>
+            m.name.trim().toLowerCase() === item.name.trim().toLowerCase() ||
+            (item.batch && m.batch && m.batch.trim().toLowerCase() === item.batch.trim().toLowerCase())
+        );
+
+        if (existingIdx >= 0) {
+          // UPDATE EXISTING MEDICINE STOCK
+          existingMedsUpdatedCount++;
+          const current = nextList[existingIdx];
+          nextList[existingIdx] = {
+            ...current,
+            stock: Number((current.stock + Number(item.qty || 0)).toFixed(1)),
+            rate: Number(item.rate) || current.rate,
+            mrp: Number(item.mrp) || current.mrp,
+            omrp: item.dmrp !== undefined && item.dmrp > 0 ? item.dmrp : current.omrp,
+            batch: item.batch || current.batch,
+            expiry: item.exp || current.expiry,
+            hsn: item.hsn || current.hsn,
+            pack: item.pack || current.pack,
+            dist: data.distributor,
+            scheme: item.scheme || current.scheme,
+            disc: item.disc !== undefined ? item.disc : current.disc,
+            gst: item.gst || current.gst,
+            salt: item.salt || current.salt,
+            company: item.company || current.company,
+          };
+        } else {
+          // AUTOMATICALLY CREATE MISSING MEDICINE
+          newMedsAddedCount++;
+          const newMedicine: Medicine = {
+            id: 'MED-OCR-' + (Date.now() + idx),
+            name: item.name.trim(),
+            company: item.company || 'Standard Pharma',
+            dist: data.distributor,
+            salt: item.salt || 'Pharmaceutical Formulation',
+            hsn: item.hsn || '300490',
+            batch: item.batch || `B-${Math.floor(1000 + Math.random() * 9000)}`,
+            pack: item.pack || '10*10',
+            group: 'General Inward',
+            rack: item.rack || 'RACK-A1',
+            stock: Number(item.qty || 0),
+            rate: Number(item.rate || 0),
+            omrp: Number(item.dmrp || 0),
+            mrp: Number(item.mrp || 0),
+            scheme: item.scheme || '0.00',
+            gst: Number(item.gst || 12),
+            disc: Number(item.disc || 0),
+            tabsPerStrip: item.tabsPerStrip || 10,
+            expiry: item.exp || '2028-12',
+          };
+          nextList.unshift(newMedicine);
+        }
+      });
+
+      return nextList;
+    });
+
+    // 3. OPTIONALLY LOG INWARD EXPENSE IN LEDGER
+    if (logAsExpense && setExpenses) {
+      const newExpense: ExpenseRecord = {
+        id: `EXP-INW-${Date.now()}`,
+        date: data.invDate || getTodayISODate(),
+        cat: 'Medicine Purchase (Stock Inward)',
+        desc: `Inward purchase from ${data.distributor} (Bill: ${data.invNo})`,
+        amt: Number(data.totalCost || 0),
+      };
+      setExpenses(prev => [newExpense, ...(prev || [])]);
+    }
+
+    // 4. RECORD IN LOCAL SESSION HISTORY
+    setInwardHistory(prev => [
+      {
+        id: 'INW-' + Date.now(),
+        date: data.invDate || getTodayISODate(),
+        distributor: data.distributor,
+        invNo: data.invNo,
+        itemCount: data.items.length,
+        newMedsCount: newMedsAddedCount,
+        totalCost: data.totalCost,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      },
+      ...prev,
+    ]);
+
+    setIsCommitted(true);
+    setSuccessNotice(
+      `✓ Inward Stock Integrated Successfully! Added ${newMedsAddedCount} missing medicines to catalog, updated stock on ${existingMedsUpdatedCount} existing items, and registered distributor "${data.distributor}".` +
+        (confidenceNote ? ` ${confidenceNote}` : '')
+    );
+    setTimeout(() => setSuccessNotice(null), 6000);
+  };
+
+  // -------------------------------------------------------------
+  // SERVER AI OCR PIPELINE WITH GENUINE BILL EXTRACTION
+  // -------------------------------------------------------------
+  const processInvoicePayload = async (payload: { imageBase64?: string; textContent?: string }) => {
+    setIsProcessing(true);
+    setErrorNotice(null);
+    setStatusMessage('Reading invoice format and parsing distributor information...');
+
+    // Surfaced whenever the server call itself failed (bad/missing API key,
+    // model error, network issue) so the final error — if we still can't
+    // extract anything — tells the user *why* instead of just "not found".
+    let serverErrorDetail: string | null = null;
+
+    try {
+      let extractedData: ScannedInvoiceData | null = null;
+
+      // 1. Try server Gemini API endpoint (authenticated — requires the
+      // `inward-ocr` permission, enforced server-side)
+      if (payload.imageBase64 || payload.textContent) {
+        try {
+          const json = await ocrApi.parseBill({
+            imageBase64: payload.imageBase64,
+            textContent: payload.textContent,
+          });
+          if (json.success && json.data && json.data.items && json.data.items.length > 0) {
+            extractedData = json.data as unknown as ScannedInvoiceData;
+          } else if (json.fallback) {
+            setStatusMessage(json.message || 'Server AI OCR is offline — falling back to on-device OCR.');
+          }
+        } catch (serverErr: any) {
+          console.warn('Backend OCR call failed, switching to on-device/local parser if available:', serverErr);
+          serverErrorDetail = serverErr?.message || null;
+          setStatusMessage('Server AI OCR unavailable — falling back to on-device OCR.');
+        }
+      }
+
+      // 2. If no server response, fall back to on-device parsing: pasted
+      // text goes straight through the tabular text parser; an image is
+      // first OCR'd fully offline (Tesseract, vendored assets — see
+      // utils/patientIdOcr.ts) and the recognized text is fed through the
+      // same parser.
+      // Tracks whether the data came from the on-device fallback rather
+      // than the server AI — that path can't reliably read decimal points
+      // or exact batch codes off a photographed table, so anything it
+      // produces is worth a manual once-over before trusting the numbers.
+      let usedOnDeviceFallback = false;
+      // Online OCR (free, cloud-based, on by default) sits between the
+      // paid server AI and the fully-offline Tesseract fallback: better
+      // read quality than on-device OCR, but still a third-party result
+      // worth a manual once-over, so it gets its own confidence note below.
+      let usedPuterOcr = false;
+
+      if (!extractedData && payload.textContent) {
+        extractedData = parseInvoiceTextLocally(payload.textContent);
+      } else if (!extractedData && payload.imageBase64 && puterOcrEnabled) {
+        try {
+          setStatusMessage('Running online OCR... this can take a few seconds.');
+          const recognizedText = await recognizeWithPuter(payload.imageBase64);
+          extractedData = parseInvoiceTextLocally(recognizedText);
+          usedPuterOcr = !!extractedData;
+        } catch (puterErr) {
+          console.warn('Online OCR failed, falling back to on-device OCR:', puterErr);
+        }
+      }
+
+      if (!extractedData && payload.imageBase64) {
+        try {
+          setStatusMessage('Running on-device OCR (offline)... this can take a few seconds.');
+          const recognizedText = await recognizeIdText(payload.imageBase64);
+          extractedData = parseInvoiceTextLocally(recognizedText);
+          usedOnDeviceFallback = !!extractedData;
+        } catch (ocrErr) {
+          console.warn('On-device OCR failed:', ocrErr);
+        }
+      }
+
+      if (!extractedData || !extractedData.items || extractedData.items.length === 0) {
+        throw new Error(
+          serverErrorDetail
+            ? `Could not detect medicine items in the provided purchase bill. Server AI OCR failed: ${serverErrorDetail}. On-device OCR could not read it either — please verify the image is clear, or paste the invoice text instead.`
+            : 'Could not detect medicine items in the provided purchase bill. Please verify the image or paste invoice text.'
+        );
+      }
+
+      // 3. Mark which items are new vs existing in our medicine catalog
+      const reconciledItems = reconcileScannedItems(extractedData.items);
+      const isNewDist = !distributors.some(
+        d => d.name.trim().toLowerCase() === extractedData!.distributor.trim().toLowerCase()
+      );
+
+      const finalInvoiceData: ScannedInvoiceData = {
+        ...extractedData,
+        items: reconciledItems,
+        isNewDistributor: isNewDist,
+      };
+
+      setScannedResult(finalInvoiceData);
+      setIsCommitted(false);
+
+      // Rows with an implausible qty/mrp/rate (see parseInvoiceTextLocally)
+      // are rejected rather than committed — surfaced here so the user
+      // knows the bill had lines OCR couldn't read reliably, distinct from
+      // the general "double-check the numbers" fallback warning below.
+      const skippedNote =
+        finalInvoiceData.skippedRowCount && finalInvoiceData.skippedRowCount > 0
+          ? ` ${finalInvoiceData.skippedRowCount} line${finalInvoiceData.skippedRowCount === 1 ? '' : 's'} on the bill could not be read reliably and ${finalInvoiceData.skippedRowCount === 1 ? 'was' : 'were'} skipped — check the physical bill and add ${finalInvoiceData.skippedRowCount === 1 ? 'it' : 'them'} manually.`
+          : '';
+
+      // Auto-commit immediately to provide instant real-time sync
+      handleCommitToStock(
+        finalInvoiceData,
+        usedOnDeviceFallback
+          ? '⚠ Read via offline on-device OCR (no AI key configured) — double-check quantities, prices, and batch numbers below before billing against this stock.' +
+              skippedNote
+          : usedPuterOcr
+          ? '⚡ Read via online OCR — double-check quantities, prices, and batch numbers below before billing against this stock.' + skippedNote
+          : skippedNote || undefined
+      );
+    } catch (err: any) {
+      console.error('Invoice processing failed:', err);
+      setErrorNotice(err.message || 'Failed to extract invoice data. Please ensure the bill is legible.');
+    } finally {
+      setIsProcessing(false);
+      setStatusMessage(null);
+    }
+  };
+
+  // -------------------------------------------------------------
+  // HANDLERS FOR FILE UPLOAD, CAMERA, AND PASTE
+  // -------------------------------------------------------------
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = event => {
+      const base64 = event.target?.result as string;
+      setPreviewImage(base64);
+      processInvoicePayload({
+        imageBase64: base64,
+      });
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleStartCamera = async () => {
+    try {
+      setIsCameraActive(true);
+      setErrorNotice(null);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
+      });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+      }
+    } catch (err) {
+      console.error('Camera access denied or unavailable:', err);
+      setErrorNotice('Camera access unavailable. Please use file upload or paste bill text.');
+      setIsCameraActive(false);
+    }
+  };
+
+  const handleStopCamera = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop());
+      streamRef.current = null;
+    }
+    setIsCameraActive(false);
+  };
+
+  const handleCaptureSnapshot = () => {
+    if (!videoRef.current) return;
+    const canvas = document.createElement('canvas');
+    canvas.width = videoRef.current.videoWidth || 640;
+    canvas.height = videoRef.current.videoHeight || 480;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
+      const base64 = canvas.toDataURL('image/jpeg');
+      setPreviewImage(base64);
+      handleStopCamera();
+      processInvoicePayload({
+        imageBase64: base64,
+      });
+    }
+  };
+
+  const handlePasteProcess = () => {
+    if (!pastedText.trim()) {
+      setErrorNotice('Please paste bill text or table content into the box.');
+      return;
+    }
+    processInvoicePayload({
+      textContent: pastedText,
+    });
+  };
+
+  // Clipboard image paste listener on window
+  useEffect(() => {
+    const handleWindowPaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      for (let i = 0; i < items.length; i++) {
+        if (items[i].type.indexOf('image') !== -1) {
+          const blob = items[i].getAsFile();
+          if (blob) {
+            const reader = new FileReader();
+            reader.onload = event => {
+              const base64 = event.target?.result as string;
+              setPreviewImage(base64);
+              setActiveInputMethod('upload');
+              processInvoicePayload({ imageBase64: base64 });
+            };
+            reader.readAsDataURL(blob);
+          }
+        }
+      }
+    };
+    window.addEventListener('paste', handleWindowPaste);
+    return () => {
+      window.removeEventListener('paste', handleWindowPaste);
+      handleStopCamera();
+    };
+  }, []);
+
+  // -------------------------------------------------------------
+  // INLINE ROW EDITING & RECONCILIATION HANDLERS
+  // -------------------------------------------------------------
+  const handleOpenEditRow = (index: number) => {
+    if (!scannedResult) return;
+    setEditingItemIdx(index);
+    setEditFormData({ ...scannedResult.items[index] });
+  };
+
+  const handleSaveEditRow = () => {
+    if (editingItemIdx === null || !editFormData || !scannedResult) return;
+
+    const oldItem = scannedResult.items[editingItemIdx];
+    const qtyDiff = Number(editFormData.qty || 0) - Number(oldItem.qty || 0);
+
+    const updatedItems = [...scannedResult.items];
+    updatedItems[editingItemIdx] = editFormData;
+
+    // Recalculate total
+    const newTotal = updatedItems.reduce((sum, it) => sum + Number(it.rate || 0) * Number(it.qty || 0), 0);
+
+    const updatedScanned = {
+      ...scannedResult,
+      items: updatedItems,
+      totalCost: Number(newTotal.toFixed(2)),
+    };
+
+    setScannedResult(updatedScanned);
+    setEditingItemIdx(null);
+    setEditFormData(null);
+
+    // Apply granular updates to live medicine catalog without touching other
+    // items. Matched against oldItem (the name/batch this row was actually
+    // committed to stock under), never editFormData — matching on the new,
+    // just-corrected name means "fixing a garbled OCR name" (the whole
+    // point of this edit form) can never find the already-committed record
+    // it's supposed to be fixing, silently leaving the garbled duplicate in
+    // live stock while the review table shows the correction as applied.
+    setMedicines(prev =>
+      prev.map(m => {
+        if (
+          m.name.trim().toLowerCase() === oldItem.name.trim().toLowerCase() ||
+          (oldItem.batch && m.batch && m.batch.trim().toLowerCase() === oldItem.batch.trim().toLowerCase())
+        ) {
+          return {
+            ...m,
+            name: editFormData.name,
+            company: editFormData.company || m.company,
+            salt: editFormData.salt || m.salt,
+            rate: Number(editFormData.rate) || m.rate,
+            mrp: Number(editFormData.mrp) || m.mrp,
+            batch: editFormData.batch || m.batch,
+            expiry: editFormData.exp || m.expiry,
+            rack: editFormData.rack || m.rack,
+            stock: Math.max(0, Number((m.stock + qtyDiff).toFixed(1))),
+          };
+        }
+        return m;
+      })
+    );
+  };
+
+  const handleDeleteRow = (index: number) => {
+    if (!scannedResult) return;
+    const itemToDelete = scannedResult.items[index];
+    const updatedItems = scannedResult.items.filter((_, idx) => idx !== index);
+    const newTotal = updatedItems.reduce((sum, it) => sum + Number(it.rate || 0) * Number(it.qty || 0), 0);
+
+    const updatedScanned = {
+      ...scannedResult,
+      items: updatedItems,
+      totalCost: Number(newTotal.toFixed(2)),
+    };
+
+    setScannedResult(updatedScanned);
+
+    // Deduct stock for deleted row only
+    if (itemToDelete) {
+      setMedicines(prev =>
+        prev.map(m => {
+          if (
+            m.name.trim().toLowerCase() === itemToDelete.name.trim().toLowerCase() ||
+            (itemToDelete.batch && m.batch && m.batch.trim().toLowerCase() === itemToDelete.batch.trim().toLowerCase())
+          ) {
+            return {
+              ...m,
+              stock: Math.max(0, Number((m.stock - Number(itemToDelete.qty || 0)).toFixed(1))),
+            };
+          }
+          return m;
+        })
+      );
+    }
+  };
+
+  const handleAddNewManualItem = () => {
+    if (!scannedResult) return;
+    const newItem: ScannedInvoiceItem = {
+      name: 'NEW MEDICINE ITEM',
+      company: 'Standard Pharma',
+      salt: 'Active Molecule',
+      pack: '10*10',
+      hsn: '300490',
+      batch: `BN-${Math.floor(100 + Math.random() * 900)}`,
+      exp: '2028-12',
+      qty: 10,
+      rate: 50.0,
+      dmrp: 0.0,
+      mrp: 75.0,
+      scheme: '0.00',
+      disc: 0.0,
+      gst: 12.0,
+      rack: 'RACK-A1',
+      tabsPerStrip: 10,
+      isNewMedicine: true,
+    };
+
+    const updatedItems = [newItem, ...scannedResult.items];
+    const newTotal = updatedItems.reduce((sum, it) => sum + Number(it.rate || 0) * Number(it.qty || 0), 0);
+
+    const updatedScanned = {
+      ...scannedResult,
+      items: updatedItems,
+      totalCost: Number(newTotal.toFixed(2)),
+    };
+
+    setScannedResult(updatedScanned);
+
+    // Add only this new single medicine to inventory
+    const newMedRecord: Medicine = {
+      id: 'MED-OCR-' + Date.now(),
+      name: newItem.name.trim(),
+      company: newItem.company,
+      dist: scannedResult.distributor,
+      salt: newItem.salt,
+      hsn: newItem.hsn,
+      batch: newItem.batch,
+      pack: newItem.pack,
+      group: 'General Inward',
+      rack: newItem.rack || 'RACK-A1',
+      stock: Number(newItem.qty || 0),
+      rate: Number(newItem.rate || 0),
+      omrp: 0,
+      mrp: Number(newItem.mrp || 0),
+      scheme: '0.00',
+      gst: Number(newItem.gst || 12),
+      disc: 0,
+      tabsPerStrip: 10,
+      expiry: newItem.exp,
+    };
+    setMedicines(prev => [newMedRecord, ...prev]);
+  };
+
+  // Export Inward Report to CSV
+  const handleExportCSV = () => {
+    if (!scannedResult) return;
+    const headers = [
+      'Item Description',
+      'Company',
+      'Salt Composition',
+      'Pack',
+      'HSN Code',
+      'Batch No',
+      'Expiry',
+      'Quantity',
+      'Purchase Rate (INR)',
+      'MRP (INR)',
+      'GST (%)',
+      'Total Net Cost (INR)',
+      'Status in Inventory',
+    ];
+
+    const rows = scannedResult.items.map(item => [
+      item.name,
+      item.company,
+      item.salt,
+      item.pack,
+      item.hsn,
+      item.batch,
+      item.exp,
+      item.qty,
+      item.rate.toFixed(2),
+      item.mrp.toFixed(2),
+      item.gst,
+      (item.rate * item.qty).toFixed(2),
+      item.isNewMedicine ? 'NEW MEDICINE ADDED' : 'EXISTING STOCK UPDATED',
+    ]);
+
+    exportToCSV(`Inward_Bill_${scannedResult.distributor.replace(/\s+/g, '_')}_${scannedResult.invNo}`, headers, rows);
+  };
+
+  // Filter items in active scanned result
+  const filteredItems = scannedResult
+    ? scannedResult.items.filter(it => {
+        const matchesSearch =
+          !searchFilter ||
+          it.name.toLowerCase().includes(searchFilter.toLowerCase()) ||
+          it.salt.toLowerCase().includes(searchFilter.toLowerCase()) ||
+          it.batch.toLowerCase().includes(searchFilter.toLowerCase()) ||
+          it.company.toLowerCase().includes(searchFilter.toLowerCase());
+
+        const matchesStatus =
+          statusFilter === 'all' ||
+          (statusFilter === 'new' && it.isNewMedicine) ||
+          (statusFilter === 'existing' && !it.isNewMedicine);
+
+        return matchesSearch && matchesStatus;
+      })
+    : [];
+
+  const newMedsCount = scannedResult ? scannedResult.items.filter(it => it.isNewMedicine).length : 0;
+  const existingMedsCount = scannedResult ? scannedResult.items.filter(it => !it.isNewMedicine).length : 0;
+
+  return (
+    <div className="space-y-6">
+      {/* 1. TOP HEADER & INWARD CAPABILITIES BAR */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div>
+          <div className="flex items-center gap-2.5 flex-wrap">
+            <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-text flex items-center gap-2.5">
+              <span>Universal Supplier Purchase Bill Auto-Scan (OCR)</span>
+            </h1>
+            <span className="bg-amber-500/20 border border-amber-500/40 text-amber-700 dark:text-amber-300 font-mono font-bold text-xs px-3 py-1 rounded-full flex items-center gap-1.5 backdrop-blur-md">
+              <Sparkles className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
+              <span>Multi-Format Distributor AI</span>
+            </span>
+          </div>
+          <p className="text-sm text-text-muted mt-1 max-w-3xl leading-relaxed">
+            Upload ANY distributor purchase invoice (PDF, photo, scan, camera, or text). The system automatically registers the distributor's name, phone, address, GSTIN, and drug license number (when printed on the bill), auto-adds missing medicines into the catalog layout, and updates existing stock balances.
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-xs bg-surface border border-border px-3 py-1.5 rounded-xl text-text-muted font-mono flex items-center gap-1.5">
+            <PackageCheck className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+            <span>Live Inventory: {medicines.length} SKUs</span>
+          </span>
+          <span className="text-xs bg-surface border border-border px-3 py-1.5 rounded-xl text-text-muted font-mono flex items-center gap-1.5">
+            <Truck className="w-4 h-4 text-primary" />
+            <span>Distributors: {distributors.length} Registered</span>
+          </span>
+        </div>
+      </div>
+
+      {/* NOTIFICATIONS */}
+      {successNotice && (
+        <div className="p-4 rounded-2xl bg-emerald-500/20 border border-emerald-500/40 text-emerald-800 dark:text-emerald-200 text-xs flex items-center justify-between backdrop-blur-xl shadow-lg animate-in fade-in">
+          <div className="flex items-center gap-2 font-semibold">
+            <CheckCircle2 className="w-5 h-5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+            <span>{successNotice}</span>
+          </div>
+          <button onClick={() => setSuccessNotice(null)} className="text-emerald-600 dark:text-emerald-400 hover:text-text p-1">
+            ✕
+          </button>
+        </div>
+      )}
+
+      {errorNotice && (
+        <div className="p-4 rounded-2xl bg-rose-500/20 border border-rose-500/40 text-rose-800 dark:text-rose-200 text-xs flex items-center justify-between backdrop-blur-xl shadow-lg animate-in fade-in">
+          <div className="flex items-center gap-2 font-semibold">
+            <AlertCircle className="w-5 h-5 text-rose-600 dark:text-rose-400 shrink-0" />
+            <span>{errorNotice}</span>
+          </div>
+          <button onClick={() => setErrorNotice(null)} className="text-rose-600 dark:text-rose-400 hover:text-text p-1">
+            ✕
+          </button>
+        </div>
+      )}
+
+      {/* 2. INGESTION HUB & METHOD SELECTOR */}
+      <div className="p-6 rounded-3xl bg-surface/90 backdrop-blur-2xl border border-border shadow-2xl space-y-5">
+        <div className="flex items-center justify-between border-b border-border pb-4 flex-wrap gap-3">
+          <div className="flex items-center gap-2.5">
+            <div className="w-9 h-9 rounded-xl bg-primary/20 border border-primary/30 flex items-center justify-center text-primary">
+              <ScanLine className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="text-sm font-bold text-text">Select Purchase Invoice Input Method</h3>
+              <p className="text-[11px] text-text-muted">Supports diverse Indian pharma formats, multi-page PDFs, and receipts</p>
+            </div>
+          </div>
+
+          {/* Mode Switcher Pills */}
+          <div className="flex items-center gap-1.5 bg-surface p-1 rounded-2xl border border-border text-xs font-semibold">
+            <button
+              onClick={() => {
+                handleStopCamera();
+                setActiveInputMethod('upload');
+              }}
+              className={`px-3 py-1.5 rounded-xl transition flex items-center gap-1.5 cursor-pointer ${
+                activeInputMethod === 'upload' ? 'bg-primary text-primary-foreground shadow-md' : 'text-text-muted hover:text-text'
+              }`}
+            >
+              <UploadCloud className="w-3.5 h-3.5" />
+              <span>File Upload</span>
+            </button>
+
+            <button
+              onClick={() => {
+                setActiveInputMethod('camera');
+                handleStartCamera();
+              }}
+              className={`px-3 py-1.5 rounded-xl transition flex items-center gap-1.5 cursor-pointer ${
+                activeInputMethod === 'camera' ? 'bg-primary text-primary-foreground shadow-md' : 'text-text-muted hover:text-text'
+              }`}
+            >
+              <Camera className="w-3.5 h-3.5" />
+              <span>Camera Scan</span>
+            </button>
+
+            <button
+              onClick={() => {
+                handleStopCamera();
+                setActiveInputMethod('paste');
+              }}
+              className={`px-3 py-1.5 rounded-xl transition flex items-center gap-1.5 cursor-pointer ${
+                activeInputMethod === 'paste' ? 'bg-primary text-primary-foreground shadow-md' : 'text-text-muted hover:text-text'
+              }`}
+            >
+              <Clipboard className="w-3.5 h-3.5" />
+              <span>Paste Text / Clipboard</span>
+            </button>
+          </div>
+        </div>
+
+        {/* ONLINE OCR TOGGLE */}
+        <div className="flex items-center justify-between gap-3 p-3 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex-wrap">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="w-8 h-8 rounded-xl bg-amber-500/20 border border-amber-500/40 flex items-center justify-center text-amber-600 dark:text-amber-400 shrink-0">
+              <Zap className="w-4 h-4" />
+            </div>
+            <div className="min-w-0">
+              <p className="text-xs font-bold text-text flex items-center gap-1.5 flex-wrap">
+                <span>Online OCR</span>
+              </p>
+              <p className="text-[10.5px] text-text-muted leading-relaxed">
+                When there's an internet connection, the bill is read by a free cloud OCR service before dropping to fully offline scanning. First use may prompt a free sign-in popup. Also toggleable from Settings.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={puterOcrEnabled}
+            onClick={handleTogglePuterOcr}
+            className={`shrink-0 w-11 h-6 rounded-full transition-colors relative cursor-pointer ${
+              puterOcrEnabled ? 'bg-amber-500' : 'bg-border'
+            }`}
+          >
+            <span
+              className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow-md transition-transform ${
+                puterOcrEnabled ? 'translate-x-5' : 'translate-x-0'
+              }`}
+            />
+          </button>
+        </div>
+
+        {/* METHOD 1: FILE DRAG & DROP UPLOADER */}
+        {activeInputMethod === 'upload' && (
+          <div className="border-2 border-dashed border-primary/40 hover:border-primary/70 p-8 rounded-3xl bg-primary/5 hover:bg-primary/10 transition-all text-center space-y-3 relative backdrop-blur-md">
+            <input
+              type="file"
+              id="purchase-bill-file-input"
+              accept="image/png,image/jpeg,image/jpg,image/webp,application/pdf"
+              onChange={handleFileUpload}
+              className="hidden"
+            />
+            <label htmlFor="purchase-bill-file-input" className="cursor-pointer space-y-3 block">
+              <div className="w-14 h-14 rounded-2xl bg-primary/20 border border-primary/30 text-primary flex items-center justify-center mx-auto shadow-inner">
+                <UploadCloud className="w-7 h-7" />
+              </div>
+              <div>
+                <p className="text-sm font-bold text-text">
+                  Click to Upload or Drag & Drop Supplier Purchase Bill
+                </p>
+                <p className="text-xs text-text-muted mt-1">
+                  Supports Multi-page PDF, PNG, JPG, WebP from any medicine distributor (Blair, Abbott, Sun Pharma, Cipla, New Uma, etc.)
+                </p>
+              </div>
+              <div className="inline-flex items-center gap-2 px-3 py-1 bg-surface border border-border rounded-full text-[11px] text-primary font-mono">
+                <Sparkles className="w-3 h-3 text-amber-600 dark:text-amber-400" />
+                <span>Auto-detects distributor format, updates stock & creates missing medicines</span>
+              </div>
+            </label>
+          </div>
+        )}
+
+        {/* METHOD 2: LIVE CAMERA SCANNER */}
+        {activeInputMethod === 'camera' && (
+          <div className="p-6 rounded-3xl bg-surface border border-border text-center space-y-4">
+            <div className="relative max-w-md mx-auto aspect-video rounded-2xl overflow-hidden bg-bg border border-border shadow-2xl flex items-center justify-center">
+              <video ref={videoRef} autoPlay playsInline className="w-full h-full object-cover" />
+              <div className="absolute inset-0 border-2 border-primary/60 rounded-2xl pointer-events-none animate-pulse m-3" />
+              <div className="absolute top-4 left-4 bg-black/70 backdrop-blur-md px-2.5 py-1 rounded-full text-[10px] font-mono text-emerald-600 dark:text-emerald-400 border border-emerald-500/30 flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+                <span>Live Camera Active</span>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-center gap-3">
+              <button
+                type="button"
+                onClick={handleCaptureSnapshot}
+                className="px-6 py-2.5 bg-primary hover:bg-primary-hover text-primary-foreground rounded-2xl text-xs font-bold flex items-center gap-2 shadow-lg shadow-primary/30 transition cursor-pointer"
+              >
+                <Camera className="w-4 h-4" />
+                <span>Capture & Scan Invoice</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleStopCamera}
+                className="px-4 py-2.5 bg-surface-elevated hover:bg-border text-text-muted rounded-2xl text-xs font-medium transition cursor-pointer"
+              >
+                Close Camera
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* METHOD 3: PASTE TEXT / RAW INVOICE DATA */}
+        {activeInputMethod === 'paste' && (
+          <div className="space-y-3">
+            <div className="p-3 rounded-2xl bg-primary/5 border border-primary/20 space-y-2">
+              <p className="text-xs text-text-muted leading-relaxed">
+                No clear scan? Copy this prompt, paste it into any free AI chat (ChatGPT, Gemini, Claude, Copilot, Meta AI — no API key needed) along with a photo or PDF of the bill, then copy the AI's reply back into the box below.
+              </p>
+              <button
+                type="button"
+                onClick={handleCopyAiPrompt}
+                className="px-4 py-2 bg-surface border border-primary/40 hover:border-primary text-primary rounded-xl text-xs font-bold flex items-center gap-1.5 transition cursor-pointer"
+              >
+                {promptCopied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                <span>{promptCopied ? 'Prompt Copied!' : 'Copy AI Prompt'}</span>
+              </button>
+            </div>
+            <label className="text-xs font-bold text-text-muted flex items-center gap-1.5">
+              <Clipboard className="w-3.5 h-3.5 text-primary" />
+              <span>Paste OCR Text, Tabular CSV, or Wholesale Email Bill</span>
+            </label>
+            <textarea
+              rows={4}
+              value={pastedText}
+              onChange={e => setPastedText(e.target.value)}
+              placeholder={`Example text:
+DISTRIBUTOR: BLAIR REMEDIES PVT. LTD.
+GSTIN: 06AAGCB6632E1ZX, Phone: +91 9728712333, Ambala Cantt
+INV NO: A002223, Date: 2026-08-19
+1. ASHTER LOTION 60ML, Qty: 2, Rate: 32.0, MRP: 220, Batch: GED048A, Exp: 2028-04
+2. DOLO 650MG 15*T, Qty: 20, Rate: 21.5, MRP: 30, Batch: DL-9941, Exp: 2027-10`}
+              className="w-full p-3 bg-surface border border-border rounded-2xl text-text font-mono text-xs outline-none focus:border-primary placeholder:text-text-muted backdrop-blur-md"
+            />
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={handlePasteProcess}
+                className="px-5 py-2 bg-primary hover:bg-primary-hover text-primary-foreground rounded-xl text-xs font-bold flex items-center gap-1.5 transition cursor-pointer"
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>Parse & Extract Lines</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Processing Indicator */}
+        {isProcessing && (
+          <div className="flex items-center justify-center gap-3 text-amber-700 dark:text-amber-300 font-bold text-xs py-4 bg-amber-500/10 rounded-2xl border border-amber-500/20 backdrop-blur-md animate-pulse">
+            <Loader2 className="w-5 h-5 animate-spin text-amber-600 dark:text-amber-400" />
+            <span>{statusMessage || 'Scanning distributor bill with AI & updating medicine stock...'}</span>
+          </div>
+        )}
+      </div>
+
+      {/* 3. ACTIVE INVOICE RECONCILIATION & STOCK INGESTION WORKSPACE */}
+      {scannedResult && (
+        <div className="p-6 rounded-3xl bg-surface/90 backdrop-blur-2xl border border-border shadow-2xl space-y-6 animate-in fade-in">
+          {/* Header & Status Badges */}
+          <div className="flex justify-between items-center border-b border-border pb-4 flex-wrap gap-3">
+            <div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="px-3 py-1 rounded-full bg-emerald-500/20 border border-emerald-500/30 text-emerald-700 dark:text-emerald-300 text-xs font-bold flex items-center gap-1.5">
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                  <span>Invoice Ingested & Synced</span>
+                </span>
+                <span className="font-mono text-xs text-text-muted bg-surface border border-border px-3 py-1 rounded-full">
+                  INV: <b className="text-text">{scannedResult.invNo}</b> ({scannedResult.invDate})
+                </span>
+              </div>
+              <h2 className="text-lg font-bold text-text mt-1">
+                Purchase Inward Reconciliation Workspace
+              </h2>
+            </div>
+
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                type="button"
+                onClick={handleAddNewManualItem}
+                className="px-3 py-1.5 bg-primary/20 hover:bg-primary/30 border border-primary/40 text-primary rounded-xl text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
+                title="Add any missing line manually"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>Add Extra Medicine</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleExportCSV}
+                className="px-3 py-1.5 bg-surface hover:bg-border-elevated border border-border text-text-muted rounded-xl text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
+                title="Download CSV report"
+              >
+                <Download className="w-3.5 h-3.5 text-primary" />
+                <span>Export CSV</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setScannedResult(null);
+                  setPreviewImage(null);
+                }}
+                className="px-4 py-1.5 bg-surface-elevated hover:bg-border text-text rounded-xl text-xs font-bold flex items-center gap-1.5 transition cursor-pointer"
+                title="Close invoice workspace"
+              >
+                <X className="w-3.5 h-3.5" />
+                <span>Close Workspace / Next Bill</span>
+              </button>
+            </div>
+          </div>
+
+          {/* DISTRIBUTOR AUTO-REGISTERED CARD */}
+          <div className="p-4 rounded-2xl bg-surface border border-border grid grid-cols-1 md:grid-cols-2 gap-4 text-xs backdrop-blur-md">
+            <div>
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-[10px] text-text-muted uppercase font-bold tracking-wider">
+                  Distributor Registration Details:
+                </span>
+                <span className="bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30 text-[10px] px-2 py-0.5 rounded-full font-semibold">
+                  ✓ Registered in Master Directory
+                </span>
+              </div>
+              <h4 className="text-sm font-bold text-text flex items-center gap-2">
+                <Truck className="w-4 h-4 text-primary" />
+                <span>{scannedResult.distributor}</span>
+              </h4>
+              <p className="text-text-muted font-mono mt-1">
+                <b>GSTIN:</b> <span className="text-primary font-bold">{scannedResult.gstin}</span>
+              </p>
+              <p className="text-text-muted font-mono mt-0.5">
+                <b>Phone:</b> <span className="text-text">{scannedResult.phone}</span>
+              </p>
+              <p className="text-text-muted mt-0.5">
+                <b>Address:</b> {scannedResult.address}
+              </p>
+              {scannedResult.dlNo && scannedResult.dlNo !== 'N/A' && (
+                <p className="text-text-muted font-mono mt-0.5">
+                  <b>DL No:</b> {scannedResult.dlNo}
+                </p>
+              )}
+            </div>
+
+            <div className="space-y-2 bg-bg/60 p-3.5 rounded-xl border border-border">
+              <div className="flex justify-between items-center">
+                <span className="text-text-muted">Billed Recipient:</span>
+                <span className="font-bold text-text">{invoiceConfig.name}</span>
+              </div>
+              <div className="flex justify-between items-center text-text-muted font-mono text-[11px]">
+                <span>Recipient Drug License:</span>
+                <span className="text-text">{invoiceConfig.dl}</span>
+              </div>
+              <div className="flex justify-between items-center text-text-muted font-mono text-[11px]">
+                <span>Recipient GSTIN:</span>
+                <span className="text-text">{invoiceConfig.gst}</span>
+              </div>
+
+              <div className="pt-2 border-t border-border flex items-center justify-between">
+                <label className="text-[11px] text-text-muted flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={logAsExpense}
+                    onChange={e => {
+                      const isChecked = e.target.checked;
+                      setLogAsExpense(isChecked);
+                      if (isChecked && setExpenses && scannedResult) {
+                        const newExpense: ExpenseRecord = {
+                          id: `EXP-INW-${Date.now()}`,
+                          date: scannedResult.invDate || getTodayISODate(),
+                          cat: 'Medicine Purchase (Stock Inward)',
+                          desc: `Inward purchase from ${scannedResult.distributor} (Bill: ${scannedResult.invNo})`,
+                          amt: Number(scannedResult.totalCost || 0),
+                        };
+                        setExpenses(prev => [newExpense, ...(prev || [])]);
+                      }
+                    }}
+                    className="w-3.5 h-3.5 rounded text-emerald-500 focus:ring-emerald-500 cursor-pointer"
+                  />
+                  <span>Record {formatMoney(scannedResult.totalCost)} in Daily Expense Ledger</span>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          {/* RECONCILIATION SUMMARY KPIS */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+            <div className="p-3.5 rounded-2xl bg-surface border border-border space-y-1">
+              <p className="text-text-muted">Total Purchase Cost</p>
+              <h4 className="text-lg font-bold text-emerald-600 dark:text-emerald-400 font-mono">
+                {formatMoney(scannedResult.totalCost)}
+              </h4>
+            </div>
+
+            <div className="p-3.5 rounded-2xl bg-surface border border-border space-y-1">
+              <p className="text-text-muted">Total Scanned Items</p>
+              <h4 className="text-lg font-bold text-text font-mono">
+                {scannedResult.items.length} Medicines
+              </h4>
+            </div>
+
+            <div className="p-3.5 rounded-2xl bg-emerald-500/10 border border-emerald-500/20 space-y-1">
+              <p className="text-emerald-700 dark:text-emerald-300 font-semibold flex items-center gap-1">
+                <PackagePlus className="w-3.5 h-3.5" />
+                <span>New Medicines Added</span>
+              </p>
+              <h4 className="text-lg font-bold text-emerald-700 dark:text-emerald-300 font-mono">
+                {newMedsCount} Missing SKUs Created
+              </h4>
+            </div>
+
+            <div className="p-3.5 rounded-2xl bg-primary/10 border border-primary/20 space-y-1">
+              <p className="text-primary font-semibold flex items-center gap-1">
+                <TrendingUp className="w-3.5 h-3.5" />
+                <span>Stock Incremented</span>
+              </p>
+              <h4 className="text-lg font-bold text-primary font-mono">
+                {existingMedsCount} Existing Medicines
+              </h4>
+            </div>
+          </div>
+
+          {/* FILTER & SEARCH BAR FOR SCANNED ITEMS */}
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div className="relative flex-1 min-w-[200px]">
+              <Search className="w-3.5 h-3.5 text-text-muted absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                placeholder="Search scanned medicines, salts, or batches..."
+                value={searchFilter}
+                onChange={e => setSearchFilter(e.target.value)}
+                className="w-full pl-9 pr-3 py-2 bg-surface border border-border rounded-xl text-xs text-text placeholder:text-text-muted outline-none focus:border-primary"
+              />
+            </div>
+
+            <div className="flex items-center gap-1.5 bg-surface p-1 rounded-xl border border-border text-xs">
+              <button
+                type="button"
+                onClick={() => setStatusFilter('all')}
+                className={`px-2.5 py-1 rounded-lg transition ${
+                  statusFilter === 'all' ? 'bg-surface-elevated text-text font-bold' : 'text-text-muted hover:text-text'
+                }`}
+              >
+                All ({scannedResult.items.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setStatusFilter('new')}
+                className={`px-2.5 py-1 rounded-lg transition ${
+                  statusFilter === 'new' ? 'bg-emerald-600 text-text font-bold' : 'text-emerald-600 dark:text-emerald-400 hover:text-text'
+                }`}
+              >
+                New Added ({newMedsCount})
+              </button>
+              <button
+                type="button"
+                onClick={() => setStatusFilter('existing')}
+                className={`px-2.5 py-1 rounded-lg transition ${
+                  statusFilter === 'existing' ? 'bg-primary text-primary-foreground font-bold' : 'text-primary hover:text-text'
+                }`}
+              >
+                Updated ({existingMedsCount})
+              </button>
+            </div>
+          </div>
+
+          {/* SCANNED ITEMS RECONCILIATION TABLE */}
+          <div className="overflow-x-auto border border-border rounded-2xl bg-surface backdrop-blur-md">
+            <table className="w-full text-left border-collapse text-xs">
+              <thead className="bg-surface-elevated text-text-muted font-bold border-b border-border text-[11px]">
+                <tr>
+                  <th className="p-3">Item Name & Salt</th>
+                  <th className="p-3">Inventory Status</th>
+                  <th className="p-3">Pack & Qty</th>
+                  <th className="p-3">Batch / Expiry</th>
+                  <th className="p-3">HSN</th>
+                  <th className="p-3">Purchase Rate</th>
+                  <th className="p-3">MRP ({currencySymbol})</th>
+                  <th className="p-3">GST% / Disc</th>
+                  <th className="p-3 text-right font-bold">Line Cost ({currencySymbol})</th>
+                  <th className="p-3 text-center">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-border text-text">
+                {filteredItems.length === 0 ? (
+                  <tr>
+                    <td colSpan={10} className="p-6 text-center text-text-muted text-xs">
+                      No medicines match the selected filter.
+                    </td>
+                  </tr>
+                ) : (
+                  filteredItems.map((item, idx) => {
+                    const rowCost = item.rate * item.qty;
+                    const marginPercent = item.mrp > 0 ? (((item.mrp - item.rate) / item.mrp) * 100).toFixed(0) : '0';
+
+                    return (
+                      <tr key={idx} className="hover:bg-surface transition group">
+                        <td className="p-3">
+                          <span className="font-bold text-text block">{item.name}</span>
+                          <span className="text-[10px] text-text-muted block">{item.salt}</span>
+                          <span className="text-[10px] text-primary font-medium">Mfg: {item.company}</span>
+                        </td>
+
+                        <td className="p-3">
+                          {item.isNewMedicine ? (
+                            <span className="inline-flex items-center gap-1 bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30 px-2 py-0.5 rounded-full text-[10px] font-bold">
+                              <PackagePlus className="w-3 h-3" />
+                              <span>New Stock Added</span>
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 bg-primary/20 text-primary border border-primary/30 px-2 py-0.5 rounded-full text-[10px] font-medium">
+                              <Check className="w-3 h-3" />
+                              <span>Stock Updated (+{item.qty})</span>
+                            </span>
+                          )}
+                        </td>
+
+                        <td className="p-3 font-mono">
+                          <span className="font-bold text-text block">{item.pack}</span>
+                          <span className="text-emerald-600 dark:text-emerald-400 font-bold">Qty: {item.qty} units</span>
+                        </td>
+
+                        <td className="p-3 font-mono text-[11px]">
+                          <span className="font-bold text-primary block">{item.batch}</span>
+                          <span className="text-text-muted block">Exp: {item.exp}</span>
+                        </td>
+
+                        <td className="p-3 font-mono text-text-muted text-[11px]">{item.hsn}</td>
+
+                        <td className="p-3 font-mono font-bold text-emerald-600 dark:text-emerald-400 text-sm">
+                          {formatMoney(item.rate)}
+                        </td>
+
+                        <td className="p-3 font-mono">
+                          <span className="font-bold text-text block">{formatMoney(item.mrp)}</span>
+                          <span className="text-[10px] text-emerald-600 dark:text-emerald-400 font-semibold">{marginPercent}% Margin</span>
+                        </td>
+
+                        <td className="p-3 font-mono text-[11px] text-text-muted">
+                          <span>{item.gst}% GST</span>
+                          {item.disc !== undefined && item.disc > 0 && (
+                            <span className="block text-primary">{item.disc}% Disc</span>
+                          )}
+                        </td>
+
+                        <td className="p-3 text-right font-mono font-bold text-text text-sm">
+                          {formatMoney(rowCost)}
+                        </td>
+
+                        <td className="p-3 text-center">
+                          <div className="flex items-center justify-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => handleOpenEditRow(idx)}
+                              className="p-1.5 hover:bg-surface-elevated text-text-muted hover:text-text rounded-lg transition"
+                              title="Edit rate, batch, or quantity"
+                            >
+                              <Edit3 className="w-3.5 h-3.5 text-primary" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteRow(idx)}
+                              className="p-1.5 hover:bg-rose-500/20 text-text-muted hover:text-rose-700 dark:hover:text-rose-300 rounded-lg transition"
+                              title="Remove item"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          {/* TOTAL FOOTER BAR */}
+          <div className="flex justify-between items-center p-4 bg-success/10 border border-success/30 rounded-2xl text-xs font-bold text-success backdrop-blur-md flex-wrap gap-3">
+            <div className="flex items-center gap-2">
+              <PackageCheck className="w-5 h-5 text-success" />
+              <span>Total Inward Purchase Value:</span>
+            </div>
+            <div className="flex items-center gap-4">
+              <span className="text-xs text-text-muted font-normal">
+                {scannedResult.items.length} Line Items &bull; {newMedsCount} New Medicines Added
+              </span>
+              <span className="text-xl font-mono font-black text-emerald-700 dark:text-emerald-300">
+                {formatMoney(scannedResult.totalCost)}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 4. MODAL: EDIT SCANNED MEDICINE ROW */}
+      {editingItemIdx !== null && editFormData && (
+        <div className="fixed inset-0 bg-[var(--color-overlay)] backdrop-blur-md z-50 flex items-center justify-center p-4">
+          <div className="bg-surface-elevated backdrop-blur-2xl rounded-3xl shadow-2xl max-w-lg w-full p-6 space-y-4 border border-border text-xs text-text animate-in zoom-in-95">
+            <div className="flex justify-between items-center border-b border-border pb-3">
+              <h3 className="text-sm font-bold text-text flex items-center gap-2">
+                <Edit3 className="w-4 h-4 text-primary" />
+                <span>Edit Inward Medicine Line</span>
+              </h3>
+              <button
+                onClick={() => setEditingItemIdx(null)}
+                className="text-text-muted hover:text-text p-1 rounded-lg"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div className="col-span-2">
+                <label className="font-semibold text-text-muted block mb-1">Medicine Name</label>
+                <input
+                  type="text"
+                  value={editFormData.name}
+                  onChange={e => setEditFormData({ ...editFormData, name: e.target.value })}
+                  className="w-full p-2.5 bg-surface border border-border rounded-xl text-text font-bold outline-none focus:border-primary"
+                />
+              </div>
+
+              <div>
+                <label className="font-semibold text-text-muted block mb-1">Salt / Molecule</label>
+                <input
+                  type="text"
+                  value={editFormData.salt}
+                  onChange={e => setEditFormData({ ...editFormData, salt: e.target.value })}
+                  className="w-full p-2.5 bg-surface border border-border rounded-xl text-text outline-none focus:border-primary"
+                />
+              </div>
+
+              <div>
+                <label className="font-semibold text-text-muted block mb-1">Mfg Company</label>
+                <input
+                  type="text"
+                  value={editFormData.company}
+                  onChange={e => setEditFormData({ ...editFormData, company: e.target.value })}
+                  className="w-full p-2.5 bg-surface border border-border rounded-xl text-text outline-none focus:border-primary"
+                />
+              </div>
+
+              <div>
+                <label className="font-semibold text-text-muted block mb-1">Purchased Quantity</label>
+                <input
+                  type="number"
+                  value={editFormData.qty}
+                  onChange={e => setEditFormData({ ...editFormData, qty: Number(e.target.value) || 1 })}
+                  className="w-full p-2.5 bg-surface border border-border rounded-xl text-text font-mono font-bold outline-none focus:border-primary"
+                />
+              </div>
+
+              <div>
+                <label className="font-semibold text-text-muted block mb-1">Purchase Rate ({currencySymbol})</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  value={editFormData.rate}
+                  onChange={e => setEditFormData({ ...editFormData, rate: Number(e.target.value) || 0 })}
+                  className="w-full p-2.5 bg-surface border border-border rounded-xl text-emerald-600 dark:text-emerald-400 font-mono font-bold outline-none focus:border-primary"
+                />
+              </div>
+
+              <div>
+                <label className="font-semibold text-text-muted block mb-1">Retail MRP ({currencySymbol})</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  value={editFormData.mrp}
+                  onChange={e => setEditFormData({ ...editFormData, mrp: Number(e.target.value) || 0 })}
+                  className="w-full p-2.5 bg-surface border border-border rounded-xl text-text font-mono font-bold outline-none focus:border-primary"
+                />
+              </div>
+
+              <div>
+                <label className="font-semibold text-text-muted block mb-1">Batch Number</label>
+                <input
+                  type="text"
+                  value={editFormData.batch}
+                  onChange={e => setEditFormData({ ...editFormData, batch: e.target.value })}
+                  className="w-full p-2.5 bg-surface border border-border rounded-xl text-text font-mono outline-none focus:border-primary"
+                />
+              </div>
+
+              <div>
+                <label className="font-semibold text-text-muted block mb-1">Expiry Date (YYYY-MM)</label>
+                <input
+                  type="text"
+                  value={editFormData.exp}
+                  onChange={e => setEditFormData({ ...editFormData, exp: e.target.value })}
+                  placeholder="2028-06"
+                  className="w-full p-2.5 bg-surface border border-border rounded-xl text-text font-mono outline-none focus:border-primary"
+                />
+              </div>
+
+              <div>
+                <label className="font-semibold text-text-muted block mb-1">Rack Location</label>
+                <input
+                  type="text"
+                  value={editFormData.rack || 'RACK-A1'}
+                  onChange={e => setEditFormData({ ...editFormData, rack: e.target.value })}
+                  className="w-full p-2.5 bg-surface border border-border rounded-xl text-text outline-none focus:border-primary"
+                />
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 pt-3 border-t border-border">
+              <button
+                type="button"
+                onClick={() => setEditingItemIdx(null)}
+                className="px-4 py-2 bg-surface hover:bg-border-elevated text-text-muted rounded-xl transition cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleSaveEditRow}
+                className="px-5 py-2 bg-primary hover:bg-primary-hover text-primary-foreground font-bold rounded-xl shadow-lg transition cursor-pointer"
+              >
+                Save & Update Stock
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 5. RECENT INWARD HISTORY LOG (Session Track) */}
+      {inwardHistory.length > 0 && (
+        <div className="p-6 rounded-3xl bg-surface/90 backdrop-blur-2xl border border-border shadow-2xl space-y-4">
+          <div className="flex items-center justify-between border-b border-border pb-3">
+            <h3 className="text-sm font-bold text-text flex items-center gap-2">
+              <History className="w-4 h-4 text-primary" />
+              <span>Recent Inward Invoices Processed</span>
+            </h3>
+            <span className="text-xs text-text-muted font-mono">
+              {inwardHistory.length} Inward Records
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 text-xs">
+            {inwardHistory.map(entry => (
+              <div
+                key={entry.id}
+                className="p-3.5 rounded-2xl bg-surface border border-border space-y-1.5 backdrop-blur-md"
+              >
+                <div className="flex justify-between items-center text-text-muted text-[11px]">
+                  <span>{entry.date} at {entry.timestamp}</span>
+                  <span className="font-mono text-primary font-bold">INV: {entry.invNo}</span>
+                </div>
+                <h4 className="font-bold text-text truncate">{entry.distributor}</h4>
+                <div className="flex justify-between items-center pt-1 border-t border-border">
+                  <span className="text-[11px] text-emerald-600 dark:text-emerald-400">
+                    {entry.itemCount} Items ({entry.newMedsCount} new added)
+                  </span>
+                  <span className="font-mono font-bold text-text">{formatMoney(entry.totalCost)}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};

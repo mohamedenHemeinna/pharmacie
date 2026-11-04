@@ -1,0 +1,73 @@
+# KinetiRx backend configuration. Every secret comes from the environment.
+# DATABASE_URL (postgres://user:pass@host:port/db) is converted to JDBC by
+# com.kinetirx.config.DatabaseUrlEnvironmentPostProcessor.
+
+server:
+  port: ${PORT:8080}
+  forward-headers-strategy: framework
+  shutdown: graceful
+
+spring:
+  application:
+    name: kinetirx-backend
+  lifecycle:
+    timeout-per-shutdown-phase: 15s
+  datasource:
+    # No default URL on purpose: the app must refuse to start without DATABASE_URL,
+    # never fall back to a local database by accident.
+    url: ${DATABASE_JDBC_URL:}
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 1
+      max-lifetime: 3600000
+      idle-timeout: 1800000
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate          # the schema is owned by Flyway; Hibernate never alters it
+    properties:
+      hibernate.jdbc.time_zone: UTC
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    # Existing databases were created by the Go migrator (V1..V11). Baselining at 11 records them
+    # as applied without running anything, so only V12+ scripts ever execute against live data.
+    baseline-on-migrate: true
+    baseline-version: 11
+    baseline-description: "Go migrator schema (0001-0011)"
+  servlet:
+    multipart:
+      max-file-size: 1GB
+      max-request-size: 1GB
+  mvc:
+    throw-exception-if-no-handler-found: true
+  web:
+    resources:
+      add-mappings: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+kinetirx:
+  jwt-secret: ${JWT_SECRET:}
+  jwt-access-token-ttl: 12h
+  allowed-origins: ${ALLOWED_ORIGINS:http://localhost:5173,http://localhost:3000}
+  gemini-api-key: ${GEMINI_API_KEY:}
+  admin-bootstrap-password: ${KINETIRX_ADMIN_PASSWORD:}
+  backup-encryption-key: ${BACKUP_ENCRYPTION_KEY:}
+
+logging:
+  pattern:
+    level: "%5p [request_id=%X{request_id}]"
